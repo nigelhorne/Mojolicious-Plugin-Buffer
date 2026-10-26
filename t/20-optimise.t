@@ -268,4 +268,65 @@ subtest 'rewrite_links can be declared for a group of pages' => sub {
 	like($group->tx->res->body, qr{href="/page"}, 'the buffer stash overrides the group');
 };
 
+# The squasher once deleted a "+" that started a line, and collapsed the
+# white space inside <pre>, <textarea> and script string literals.  Each of
+# these changes what the reader sees or what a script does.
+subtest 'squashing does not corrupt significant content' => sub {
+	my $page = join("\n",
+		'<html><body>',
+		'<p>Call us on',
+		'+44 20 7946 0000</p>',
+		"<pre>a    b\n    indented\n\ttabbed</pre>",
+		"<textarea name=\"t\">x    y\n   z</textarea>",
+		'<script>var s = "x    y";',
+		'var total = 1',
+		'+ 2;</script>',
+		'<style>p::before { content: "a    b"; }</style>',
+		'</body></html>',
+	);
+
+	my $squash = Mojolicious->new;
+	$squash->log->level('fatal');
+	$squash->plugin('Buffer', optimise_content => 1);
+	$squash->routes->get('/' => sub { shift->render(text => $page) });
+
+	my $st = Test::Mojo->new($squash);
+	$st->ua->transactor->compressed(0);
+	$st->get_ok('/')->status_is(200);
+	my $body = $st->tx->res->body;
+
+	like($body, qr/\+44 20 7946 0000/, 'a "+" at the start of a line survives');
+	like($body, qr/<pre>a    b\n    indented\n\ttabbed<\/pre>/, '<pre> content is untouched');
+	like($body, qr/<textarea name="t">x    y\n   z<\/textarea>/, '<textarea> content is untouched');
+	like($body, qr/"x    y"/, 'white space inside a script string literal survives');
+	like($body, qr/1\s*\+\s*2/, 'a "+" continuing a script expression survives');
+	like($body, qr/content: ?"a    b"/, 'white space inside a CSS string survives');
+	cmp_ok(length($body), '<', length($page), 'the rest of the page was still optimised');
+};
+
+subtest 'a body that already contains the placeholder marker is restored exactly' => sub {
+	my $page = "<p>\x00MPB0\x00MPB</p>\n  <pre>  keep  </pre>\n  <p>end</p>";
+
+	my $marker = Mojolicious->new;
+	$marker->log->level('fatal');
+	$marker->plugin('Buffer', optimise_content => 1);
+	$marker->routes->get('/' => sub { shift->render(data => $page, format => 'html') });
+
+	my $mt = Test::Mojo->new($marker);
+	$mt->ua->transactor->compressed(0);
+	$mt->get_ok('/')->status_is(200);
+	my $body = $mt->tx->res->body;
+
+	like($body, qr/\x00MPB0\x00MPB/, 'the text that looks like a marker is kept');
+	like($body, qr/<pre>  keep  <\/pre>/, 'the protected element is restored');
+};
+
+subtest 'optimise_content rejects unknown levels' => sub {
+	eval { Mojolicious->new->plugin('Buffer', optimise_content => 3) };
+	like($@, qr/optimise_content must be 0, 1 or 2/, 'level 3 is rejected');
+
+	eval { Mojolicious->new->plugin('Buffer', optimise_content => 'max') };
+	like($@, qr/optimise_content must be 0, 1 or 2/, 'a word is rejected');
+};
+
 done_testing();

@@ -74,6 +74,58 @@ subtest 'options are validated' => sub {
 	like($@, qr/template_mtime_cache_duration must be a duration/, 'the mtime cache duration must be a duration');
 };
 
+# Every option is now checked against a schema when the plugin is
+# registered, rather than failing in the middle of a request
+subtest 'every option has a schema and a message' => sub {
+	my %bad = (
+		compress_content => [[], qr/compress_content must be a true or false value/],
+		rewrite_links => [{}, qr/rewrite_links must be a true or false value/],
+		generate_etag => [sub {}, qr/generate_etag must be a true or false value/],
+		generate_304 => [[], qr/generate_304 must be a true or false value/],
+		trust_last_modified => [[], qr/trust_last_modified must be a true or false value/],
+		cache_single_flight => [[], qr/cache_single_flight must be a true or false value/],
+		optimise_content => [-1, qr/optimise_content must be 0, 1 or 2/],
+		last_modified => [[], qr/last_modified must be 0, 1, an epoch/],
+		min_compress_size => ['big', qr/min_compress_size must be a non-negative integer/],
+		cache_duration => ['', qr/cache_duration must be a duration/],
+		cache_key => [[], qr/cache_key must be a string or a code reference/],
+		cache => [{}, qr/cache must be an object understanding get\(\), set\(\) and remove\(\)/],
+		excluded_types => ['text/plain', qr/excluded_types must be an array reference/],
+		vary_by => [['cookie', ''], qr/vary_by must be an array reference of header names/],
+		messages => ['English', qr/messages must be a hash reference/],
+		cache_lock_timeout => [-1, qr/cache_lock_timeout must be a positive number/],
+		cache_lock_dir => [\'dir', qr/cache_lock_dir must be a directory path/],
+	);
+
+	for my $name (sort keys %bad) {
+		my ($value, $message) = @{$bad{$name}};
+		eval { Mojolicious->new->plugin('Buffer', $name => $value) };
+		like($@, $message, "a bad $name is rejected with its own message");
+	}
+
+	ok(eval { Mojolicious->new->plugin('Buffer', compress_content => '', cache_lock_timeout => '0.5', last_modified => 'Sun, 06 Nov 1994 08:49:37 GMT', cache_key => sub { 'k' }); 1 },
+		'false strings, fractional timeouts, date strings and coderefs are accepted')
+		or diag($@);
+};
+
+subtest 'the first bad option is reported deterministically' => sub {
+	# Several bad options: the sorted first one is always the one named
+	for (1 .. 5) {
+		eval { Mojolicious->new->plugin('Buffer', vary_by => 'x', cache => 'x', encodings => 'x') };
+		like($@, qr/: cache must be an object/, 'cache sorts first and is reported');
+	}
+};
+
+subtest 'messages override the catalog at registration' => sub {
+	eval {
+		Mojolicious->new->plugin('Buffer',
+			messages => {unknown_option => q{Unbekannte Option '%{option}'}},
+			wibble => 1,
+		);
+	};
+	like($@, qr/Unbekannte Option 'wibble'/, 'an unknown option is reported in the overriding language');
+};
+
 subtest 'multibyte bodies get a byte length' => sub {
 	my $t = Test::Mojo->new(build_app());
 	$t->ua->transactor->compressed(0);

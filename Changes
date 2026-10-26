@@ -2,6 +2,30 @@ Revision history for Mojolicious-Plugin-Buffer
 
 0.001.0
 	Initial version.
+	Fix optimise_content deleting a "+" at the start of a line, which
+	corrupted text such as phone numbers and changed the meaning of
+	JavaScript, and stop it collapsing white space inside <pre>,
+	<textarea>, <script> and <style>.
+	Parse Cache-Control with Mojo::Util::split_header, so an extension
+	directive such as no-cache-foo no longer bypasses the cache.
+	Re-enable t/85-example.t and t/86-grouped-example.t, which had been
+	skipping since eg/ was renamed examples/.
+	Validate every option against a Params::Validate::Strict schema at
+	registration, including optimise_content (0, 1 or 2), the boolean
+	flags, min_compress_size, last_modified and cache_duration.
+	Add Mojolicious::Plugin::Buffer::I18N and the messages option: every
+	error, log line and the 503 text come from one catalog and can be
+	reworded or translated, with sprintf formats, plural and gender
+	variants.  The 503 body is sent as UTF-8.
+	Log lines are built lazily and as one string, so they no longer
+	contain doubled spaces or cost anything when debug is off.
+	Lock::File reports the OS error text without File::Path's own
+	"at FILE line N", and release() now reports unlock failures.
+	Guard private routines with Sub::Private (enforce mode) and the
+	extension points (_optimise, _process, _is_cached, Lock backends'
+	_path, _key, _token, _client) with Sub::Protected.
+	Add t/15-i18n.t, t/16-encapsulation.t and t/locales.t (GeoIP and
+	POSIX locale behaviour).
 	Make the different-keys single-flight test independent of the order in
 	which concurrent requests reach their actions.
 	Fold the simulated no-HTML::Packer test into the hidden-module suite,

@@ -202,6 +202,26 @@ subtest 'requests that must bypass the cache' => sub {
 	isnt($t->tx->res->body, $posted, 'POST is not cached');
 };
 
+# Cache-Control is parsed as a list of directives, not searched with a
+# regular expression, so a directive is only recognised by its exact name
+subtest 'Cache-Control directives are parsed, not pattern matched' => sub {
+	my $cache = TestCache->new;
+	my ($app, $t) = new_test(cache => $cache);
+
+	for my $control ('max-age=0', 'MAX-AGE = 0', 'public, no-store', 'private="X-Foo"') {
+		$t->get_ok('/page' => {'Cache-Control' => $control})->status_is(200);
+		$t->header_isnt('X-Cache' => 'HIT', "'$control' bypasses the cache");
+	}
+	is($cache->{sets}, 0, 'none of those was stored');
+
+	# A directive that merely starts with a forbidding name is someone
+	# else's extension, and a non-zero max-age is ordinary revalidation
+	$t->get_ok('/page' => {'Cache-Control' => 'no-cache-extension'})->status_is(200)
+		->header_is('X-Cache' => 'MISS');
+	$t->get_ok('/page' => {'Cache-Control' => 'max-age=60'})->status_is(200)
+		->header_is('X-Cache' => 'HIT', 'max-age=60 may use the entry');
+};
+
 subtest 'responses that must not be stored' => sub {
 	my $cache = TestCache->new;
 	my ($app, $t) = new_test(cache => $cache);

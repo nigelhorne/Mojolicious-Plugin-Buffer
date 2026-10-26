@@ -11,12 +11,12 @@ declaration form, so both are visible side by side:
 
 From the distribution root:
 
-    perl eg/grouped-sections/script/grouped_sections daemon -l http://127.0.0.1:3000
+    perl examples/grouped-sections/script/grouped_sections daemon -l http://127.0.0.1:3000
 
 Or with `morbo` if it is installed, remembering that its options come before
 the application:
 
-    morbo -l http://127.0.0.1:3000 eg/grouped-sections/script/grouped_sections
+    morbo -l http://127.0.0.1:3000 examples/grouped-sections/script/grouped_sections
 
 ## The optimised section
 

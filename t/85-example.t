@@ -11,7 +11,7 @@ use Mojo::UserAgent;
 use POSIX qw(WNOHANG);
 use Time::HiRes ();
 
-# Smoke test for the runnable example in eg/hypnotoad: start it under
+# Smoke test for the runnable example in examples/hypnotoad: start it under
 # hypnotoad on an unused port and check that the cached route misses once and
 # then hits, so the documented deployment really works.
 
@@ -32,7 +32,7 @@ eval { require CHI; 1 }
 	or plan skip_all => 'the example needs CHI';
 
 my $root    = dirname(dirname(File::Spec->rel2abs($0)));
-my $example = File::Spec->catdir($root, 'eg', 'hypnotoad');
+my $example = File::Spec->catdir($root, 'examples', 'hypnotoad');
 my $script  = File::Spec->catfile($example, 'script', 'my_app');
 plan skip_all => 'the runnable example is missing' unless -f $script;
 

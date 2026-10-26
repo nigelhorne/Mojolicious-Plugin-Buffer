@@ -103,9 +103,11 @@ that were built with `$c->res->body` rather than `$c->render`.
 ## Options
 
 All options can be given to `plugin()` and, except where noted, overridden
-per request through the `buffer` stash value.  A few describe a section of a
-site rather than one page and can be declared once for it; see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages).
+per request through the `buffer` stash value.  Options given to `plugin()`
+are validated when the plugin is registered; values in the `buffer` stash
+are not, and an unusable one falls back to its default where that is safe.
+A few options describe a section of a site rather than one page and can be
+declared once for it; see ["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages).
 
 ### Declaring Options for a Group of Pages
 
@@ -123,40 +125,40 @@ use Mojo::Base 'Mojolicious::Controller';
 has buffer_optimise_content => 1;
 ```
 
-A route default is an ordinary stash value, so `$app->defaults(...)` and a
-`before_action` that sets one work as well.  The controller form is a method
-named `buffer_` followed by the option name, and is only consulted when the
-stash says nothing: `has` is the declarative way to write it, and a plain
-`sub buffer_optimise_content { 1 }` covers a value that depends on the request.
+A route default is an ordinary stash value, so `$app->defaults(...)` and
+a `before_action` that sets one work as well.  The controller form is a
+method named `buffer_` followed by the option name, and is only consulted
+when the stash says nothing: `has` is the declarative way to write it, and a
+plain `sub buffer_optimise_content { 1 }` covers a value that depends on the
+request.  A controller method that dies is logged at debug level and
+ignored, so the plugin option stays in force.
 
 The most specific declaration wins:
 
-1. the `buffer` stash, for a single response
-2. a route default, which includes one an `under` route sets
-3. the controller declaration
-4. the plugin option
+- 1. the `buffer` stash, for a single response
+- 2. a route default, which includes one an `under` route sets
+- 3. the controller declaration
+- 4. the plugin option
 
 A route default of `0` therefore opts one page back out of a group that has
 the option on, and the `buffer` stash overrides both.
 
 Only the options that describe the content of a section are declarable:
 
-- ["compress\_content"](#compress_content) - a section serving files that are
-  already compressed
-- ["optimise\_content"](#optimise_content) - a static section that is always
-  minified
-- ["rewrite\_links"](#rewrite_links) - a section whose HTML is used elsewhere,
-  so its absolute links must survive
-- ["trust\_last\_modified"](#trust_last_modified) - a section that renders
-  templates and nothing else
+- ["compress\_content"](#compress_content) - a section serving files that are already
+compressed
+- ["optimise\_content"](#optimise_content) - a static section that is always minified
+- ["rewrite\_links"](#rewrite_links) - a section whose HTML is used elsewhere, so its
+absolute links must survive
+- ["trust\_last\_modified"](#trust_last_modified) - a section that renders templates and nothing
+else
 
-Everything else, including ["generate\_etag"](#generate_etag) and
-["generate\_304"](#generate_304), stays a per-response or per-application
-decision; those sections say why.  Any option can still be set for one
-response through the `buffer` stash.
+Everything else, including ["generate\_etag"](#generate_etag) and ["generate\_304"](#generate_304), stays a
+per-response or per-application decision; those sections say why.  Any option
+can still be set for one response through the `buffer` stash.
 
-[`eg/grouped-sections`](eg/grouped-sections/README.md) is a runnable site with
-one section declared on an `under` route and one declared in a controller.
+`examples/grouped-sections` is a runnable site with one section declared on
+an `under` route and one declared in a controller.
 
 ### Compress\_Content
 
@@ -166,12 +168,13 @@ response will then not be compressed at all).  The encodings offered to
 clients are controlled by ["encodings"](#encodings).
 
 It can be declared for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which
-is the point of a section that serves files it has already compressed.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which is the point of a section
+that serves files it has already compressed.
 
 ### Optimise\_Content
 
-How hard to optimise HTML, defaults to 0 (off):
+How hard to optimise HTML, defaults to 0 (off).  Registration rejects any
+value other than 0, 1 or 2:
 
 - 0 - leave the HTML alone
 - 1 - remove superfluous white space, rewrite same-site links and, when
@@ -181,41 +184,44 @@ is installed, which can break scripts that rely on the
 `<!-- ... -->` hiding technique
 
 Optimisation only applies to `text/html` and `application/xhtml+xml`
-responses.  [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) is optional: without it the white-space
-squashing and link rewriting still run, but comments and embedded CSS and
-JavaScript are left alone, as they are by [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and
-[FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  Install [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) for the full effect.
+responses.  The content of `<pre>`, `<textarea>`,
+`<script>` and `<style>` elements is never touched by the
+white-space squashing, because white space there is significant.
+[HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) is optional: without it the white-space squashing and link
+rewriting still run, but comments and embedded CSS and JavaScript are left
+alone, as they are by [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  Install
+[HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) for the full effect.
 
 It can be declared for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a
-static section that is always minified.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a static section that is
+always minified.
 
 ### Rewrite\_Links
 
 When optimising, rewrite `<a href>` and `<img src>` links that
 point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
-Defaults to 1.  Has no effect unless ["optimise\_content"](#optimise_content) is enabled.
+Defaults to 1.  Has no effect unless ["optimise\_content"](#optimise_content) is enabled.  Only
+double-quoted attribute values are recognised.
 
 It can be declared for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which
-matters for a section whose HTML is not used in place: a preview of a
-newsletter or a page rendered for another site needs its absolute URLs kept
-while still being optimised elsewhere.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which matters for a section
+whose HTML is not used in place: a preview of a newsletter or a page rendered
+for another site needs its absolute URLs kept while still being optimised
+elsewhere.
 
 ### Generate\_Etag
 
 Add an `ETag` header to `200` responses to `GET` and `HEAD` requests,
 defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
-representation of the same page have different tags.
+representation of the same page have different tags.  An `ETag` set by the
+action is kept.
 
 It is not declarable for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)):
-whether a digest is worth computing is a decision for one endpoint, not a
-policy for a section.  Skip the digest for one response with
-`$c->stash(buffer => {generate_etag => 0})`, or for the whole application with
-the plugin option.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)): whether a digest is worth
+computing is a decision for one endpoint, not a policy for a section.  Skip
+the digest for one response with `$c->stash(buffer => {generate_etag => 0})`, or for the whole application with the plugin option.
 
 ### Generate\_304
 
@@ -234,12 +240,11 @@ response.  Clients that have the tag, which includes browsers after the first
 `200`, send `If-None-Match` and are unaffected.
 
 It is not declarable for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)):
-it decides whether a client is told its copy is current, so a section that
-could also turn the answer off would contradict
-["trust\_last\_modified"](#trust_last_modified).  Use
-`$c->stash(buffer => {generate_304 => 0})` where one endpoint must always send
-a body.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)): it decides whether a client is
+told its copy is current, so a section that could also turn the answer off
+would contradict ["trust\_last\_modified"](#trust_last_modified).  Use
+`$c->stash(buffer => {generate_304 => 0})` where one endpoint must always
+send a body.
 
 ### Last\_Modified
 
@@ -254,11 +259,13 @@ May be:
 (`$0`) and the files and directories under the renderer's template paths
 - a number - a Unix epoch
 - a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can parse
-- a coderef - called with the controller, returns any of the above
+- a coderef - called with the controller, returns 0, 1, an epoch or a
+date string (a coderef returning another coderef is treated as 0)
 
 The value is ignored for responses that are not `200` responses to
 `GET` or `HEAD` requests.  If `If-None-Match` is present it takes
-precedence over `If-Modified-Since`, as required by RFC 7232.
+precedence over `If-Modified-Since`, as required by RFC 7232.  A
+`Last-Modified` header set by the action is kept.
 
 The default is the newest mtime of the application file and the files and
 directories under the renderer's `paths`, so editing a template changes
@@ -300,11 +307,10 @@ Use it per response instead with `$c->stash(buffer => {trust_last_modified
 &#x3d;> 1})` when only some pages are that predictable.
 
 It can be declared for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a
-section that renders templates and nothing else.  The declaration has no
-effect when ["generate\_304"](#generate_304) is off, and it cannot make a page
-safe: it only says that the application and its templates really are the only
-inputs.
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a section that renders
+templates and nothing else.  The declaration has no effect when
+["generate\_304"](#generate_304) is off, and it cannot make a page safe: it only says that the
+application and its templates really are the only inputs.
 
 ### Last-Modified Performance
 
@@ -367,16 +373,18 @@ human-readable duration.
 
 ### Min\_Compress\_Size
 
-Do not compress bodies smaller than this many bytes, defaults to 32.
-Compression is also skipped if it would not make the body smaller.
+Do not compress bodies smaller than this many bytes, defaults to 32.  Must be
+a non-negative integer.  Compression is also skipped if it would not make the
+body smaller.
 
 ### Encodings
 
 An arrayref of the content codings to offer, in server preference order.
 Defaults to `[qw(br zstd gzip)]`.  `br` is only offered if
 [IO::Compress::Brotli](https://metacpan.org/pod/IO%3A%3ACompress%3A%3ABrotli) is installed and `zstd` only if [Compress::Zstd](https://metacpan.org/pod/Compress%3A%3AZstd)
-is installed; gzip is always available.  Clients pick with the usual
-quality values, and `identity` is used when nothing acceptable is offered.
+is installed; gzip is always available.  `x-gzip` is accepted as a synonym
+for `gzip`.  Clients pick with the usual quality values, and `identity` is
+used when nothing acceptable is offered.
 
 ### Compressible\_Types
 
@@ -408,7 +416,9 @@ or a human-readable duration.
 
 A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
-when the response depends on something the default key does not cover.
+when the response depends on something the default key does not cover.  An
+empty string, or a coderef returning nothing, falls back to the generated
+key.
 
 ### Cache\_Single\_Flight
 
@@ -444,7 +454,8 @@ workers that cannot share a directory.  It must implement:
     Return a truthy guard if the lock was acquired, `(undef, undef)` if another
     process holds it, and `(undef, $error)` if the backend failed.  On an error
     the plugin logs the message and continues with a per-worker flight, so a
-    cache miss is still built.
+    cache miss is still built.  An exception thrown by `acquire` is treated as
+    an error.
 
     The call is synchronous and runs before the action is allowed to continue.
     A backend must therefore be quick and must not depend on the event loop; an
@@ -459,7 +470,8 @@ workers that cannot share a directory.  It must implement:
     Release a guard returned by `acquire`.  The guard is opaque to the plugin.
     Releasing a lock that has already expired is allowed.  If release fails, the
     lock should expire on its own; the backend can return `(0, $error)` so the
-    failure is logged.
+    failure is logged.  A backend that returns nothing is treated as having
+    released the lock.
 
 The cache itself must still be shared between the workers.  The built-in
 backends are [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile), selected with
@@ -472,7 +484,8 @@ the plugin is registered rather than per response.
 How long a request may wait for another request, in this worker or another
 one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
 long a key is considered to be in flight when the request building it never
-finishes.  Fractional seconds are allowed, so `0.5` is valid.
+finishes.  Fractional seconds are allowed, so `0.5` is valid; zero and
+negative values are rejected.
 
 ### Cache\_Lock\_Dir
 
@@ -505,21 +518,228 @@ An arrayref of request header names that become part of the generated cache
 key.  Defaults to `['cookie']`, which keeps one client's session from being
 served to another.  Set it to `[]` for URL-only caching of pages that are
 identical for every visitor, or add e.g. `'accept-language'` when the
-response varies by language.  Headers listed here may also appear in the
-response's `Vary` header; a response that varies on anything else is not
-stored.
+response varies by language.  Header names are case-insensitive.  Headers
+listed here may also appear in the response's `Vary` header; a response
+that varies on anything else is not stored.
+
+### Messages
+
+A hash reference of message overrides, keyed by message key, used for every
+error, log line and client-facing text the plugin produces, including the
+body of the `503` sent to a request that gave up waiting.  See
+[Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N) for the keys, the placeholder syntax
+and plural and gender variants:
+
+```perl
+plugin 'Buffer' => {
+    messages => {
+        retry_later => "Die Seite wird gerade erstellt, bitte versuchen Sie es gleich noch einmal.\n",
+    },
+};
+```
+
+It is passed to the lock backend built from ["cache\_lock\_dir"](#cache_lock_dir).  It is read
+when the plugin is registered, not per response.
 
 ## Methods
 
 `Mojolicious::Plugin::Buffer` inherits all methods from
-[Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin) and implements the following new one.  It also adds
+[Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin) and implements the following new ones.  It also adds
 the ["buffer\_is\_cached"](#buffer_is_cached) helper to the application.
 
 ### Register
 
 ```perl
-$plugin->register(Mojolicious->new, {optimise_content => 1});Register the plugin, usually through C<$app-E<gt>plugin('Buffer', ...)>.
-Croaks if an unknown option is given or an option has the wrong shape.
+$plugin->register(Mojolicious->new, {optimise_content => 1});
+```
+
+#### Purpose
+
+Validate the options, install the `after_dispatch` hook that reworks every
+response, and add the ["buffer\_is\_cached"](#buffer_is_cached) helper.  It is normally called for
+you by `$app->plugin('Buffer', ...)`.
+
+#### Arguments
+
+- `$app` (positional, required)
+
+    The [Mojolicious](https://metacpan.org/pod/Mojolicious) application.
+
+- `\%options` (positional, optional)
+
+    The options described under ["OPTIONS"](#options), as a hash reference or a flat list.
+
+#### Returns
+
+The plugin object, so calls can be chained.
+
+#### Side Effects
+
+- Turns off ["compress" in Mojolicious::Renderer](https://metacpan.org/pod/Mojolicious%3A%3ARenderer#compress), because this plugin does
+the compression; see ["Interaction with the renderer"](#interaction-with-the-renderer).
+- Adds an `after_dispatch` hook and a `buffer_is_cached` helper.
+- Creates ["cache\_lock\_dir"](#cache_lock_dir) if it is given and missing.
+- Loads the optional compression modules named by ["encodings"](#encodings), and
+logs at debug level when ["optimise\_content"](#optimise_content) is on without [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker).
+
+#### Example
+
+```perl
+use Mojolicious::Lite;
+use CHI;
+
+plugin 'Buffer' => {
+    optimise_content => 1,
+    cache            => CHI->new(driver => 'File', root_dir => '/var/cache/myapp'),
+    cache_lock_dir   => '/var/lib/myapp/buffer-locks',
+    vary_by          => [],     # pages are the same for everyone
+};
+
+get '/' => sub {
+    my $c = shift;
+    return if $c->buffer_is_cached;
+    $c->render(text => 'Hello');
+};
+
+app->start;
+```
+
+#### Api Specification
+
+##### Input
+
+```perl
+# Params::Get::get_params(undef, @_) after $app, then one
+# Params::Validate::Strict::validate_strict call per option
+{
+    app                           => { type => 'object', can => [qw(hook helper renderer log)] },
+    compress_content              => { type => 'scalar', optional => 1 },
+    optimise_content              => { type => 'integer', min => 0, max => 2, optional => 1 },
+    rewrite_links                 => { type => 'scalar', optional => 1 },
+    generate_etag                 => { type => 'scalar', optional => 1 },
+    generate_304                  => { type => 'scalar', optional => 1 },
+    trust_last_modified           => { type => 'scalar', optional => 1 },
+    last_modified                 => [ { type => 'scalar' }, { type => 'coderef' } ],
+    template_mtime_cache          => { type => 'object', can => [qw(get set)], optional => 1 },
+    template_mtime_cache_duration => { type => 'string', min => 1, optional => 1 },
+    min_compress_size             => { type => 'integer', min => 0 },
+    encodings                     => { type => 'arrayref' },   # of br|zstd|gzip|x-gzip
+    compressible_types            => { type => 'arrayref' },   # of strings or qr//
+    excluded_types                => { type => 'arrayref' },   # of strings or qr//
+    cache                         => { type => 'object', can => [qw(get set remove)], optional => 1 },
+    cache_duration                => { type => 'string', min => 1, optional => 1 },
+    cache_key                     => [ { type => 'string' }, { type => 'coderef' } ],
+    cache_single_flight           => { type => 'scalar', optional => 1 },
+    cache_lock_timeout            => { type => 'number', optional => 1 },   # > 0
+    cache_lock                    => { type => 'object', can => [qw(acquire release)], optional => 1 },
+    cache_lock_dir                => { type => 'string', min => 1, optional => 1 },
+    vary_by                       => { type => 'arrayref' },   # of non-empty strings
+    messages                      => { type => 'hashref', optional => 1 },
+}
+```
+
+##### Output
+
+```perl
+# Return::Set schema
+{ type => 'object', isa => 'Mojolicious::Plugin::Buffer' }
+```
+
+#### Messages
+
+Every message croaks, from the caller's point of view.  The key is the
+[Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N) key that can be overridden.
+
+```perl
+Key                             Message (after "Mojolicious::Plugin::Buffer: ")     Resolution
+------------------------------  --------------------------------------------------  ---------------------------------
+options_not_hash                options must be a hash reference                    Pass {...} or a key/value list
+unknown_option                  unknown option 'NAME'                               Check the spelling in OPTIONS
+option_flag                     NAME must be a true or false value                  Pass 0 or 1, not a reference
+option_optimise_content         optimise_content must be 0, 1 or 2                  Use one of the documented levels
+option_last_modified            last_modified must be 0, 1, an epoch, a date        Pass a scalar or a coderef
+                                string or a code reference
+option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 32
+option_encodings                encodings must be an array reference                Pass [qw(br gzip)]
+unknown_encoding                unknown encoding 'NAME'                             Use br, zstd, gzip or x-gzip
+option_compressible_types       compressible_types must be an array reference       Pass [qr{^text/}, ...]
+option_excluded_types           excluded_types must be an array reference           Pass [qr{^text/event-stream$}]
+option_vary_by                  vary_by must be an array reference of header names  Pass e.g. ['cookie']
+option_cache_key                cache_key must be a string or a code reference      Pass a string or sub
+option_cache                    cache must be an object understanding get(), set()  Pass a CHI object
+                                and remove()
+option_cache_duration           cache_duration must be a duration                   Pass e.g. '10 minutes'
+option_template_mtime_cache     template_mtime_cache must be an object              Pass a CHI object
+                                understanding get() and set()
+option_template_mtime_cache_duration
+                                template_mtime_cache_duration must be a duration    Pass e.g. 10
+option_cache_lock_timeout       cache_lock_timeout must be a positive number of     Pass e.g. 10 or 0.5
+                                seconds
+option_cache_lock               cache_lock must be an object with acquire() and     See cache_lock
+                                release() methods
+option_cache_lock_dir           cache_lock_dir must be a directory path             Pass a non-empty string
+lock_options_combined           cache_lock and cache_lock_dir cannot be combined    Use one of the two
+option_messages                 messages must be a hash reference                   Pass {key => 'text'}
+lock_dir_create_failed          cannot create cache_lock_dir 'DIR': OS ERROR        See Lock::File
+lock_dir_not_writable           cache_lock_dir 'DIR' is not a writable directory    See Lock::File
+```
+
+A failure to validate `$app` itself is reported by [Params::Validate::Strict](https://metacpan.org/pod/Params%3A%3AValidate%3A%3AStrict)
+and is not translated.
+
+#### Formal Specification
+
+```
+[OPTION, VALUE, APP]
+
+Known == dom Schema
+Valid == { o : Known; v : VALUE | v ∈ Schema(o) }
+
+┌─ Plugin ────────────────────────────────────
+│ options : OPTION ⇸ VALUE
+│ inflight : KEY ⇸ Flight
+│ lock : LockBackend ∪ {⊥}
+├─────────────────────────────────────────────
+│ dom options = Known
+│ ∀ o : dom options • (o, options o) ∈ Valid
+└─────────────────────────────────────────────
+
+┌─ Register ──────────────────────────────────
+│ ΔPlugin
+│ app? : APP ; conf? : OPTION ⇸ VALUE ; result! : Plugin
+├─────────────────────────────────────────────
+│ dom conf? ⊆ Known
+│ ∀ o : dom conf? • (o, conf? o) ∈ Valid
+│ ¬(cache_lock ∈ dom conf? ∧ cache_lock_dir ∈ dom conf?)
+│ ran (conf? encodings) ⊆ {br, zstd, gzip, x-gzip}
+│ options′ = Defaults ⊕ conf?
+│ inflight′ = ∅
+│ compress(renderer app?)′ = false
+│ after_dispatch ∈ hooks(app?)′ ∧ buffer_is_cached ∈ helpers(app?)′
+│ result! = θPlugin′
+└─────────────────────────────────────────────
+
+-- Any violated predicate: croak, app? is unchanged
+```
+
+#### Pseudocode
+
+```
+accept the options as a hash reference or a key/value list
+check the application object
+adopt the messages option first, so later errors can be reworded
+start from the defaults
+for each option given, in sorted order:
+    croak if it is unknown
+    croak with its own message if its value does not fit its schema
+croak if both cache_lock and cache_lock_dir were given
+build the lock backend: the given object, or a file backend for the dir
+canonicalise encodings, croak on unknown ones, drop unavailable ones
+log once if optimisation is on without HTML::Packer
+turn off the renderer's own compression
+hook after_dispatch to rework every response
+add the buffer_is_cached helper
+return the plugin
 ```
 
 ### Buffer\_Is\_Cached
@@ -532,6 +752,12 @@ get '/expensive' => sub {
     $c->render(template => 'expensive');
 };
 ```
+
+#### Purpose
+
+A helper, added to the application by ["register"](#register), that lets an action skip
+its work when a finished copy of the page is already cached, or when another
+request is already building it.
 
 Look for a cached response and, if there is one, replay its status, headers
 and body, add `X-Cache: HIT`, finish the response and return true.  The
@@ -558,13 +784,186 @@ is significant.
 Concurrent misses for the same key are coalesced within a worker, or across
 workers when ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) is set: while one request
 is building an entry, later requests wait for it and replay the result
-instead of running the action again.  The waiting requests are held asynchronously, so this
-works for actions that themselves use the event loop.  See
-["cache\_single\_flight"](#cache_single_flight) for the failure and timeout behaviour.
+instead of running the action again.  The waiting requests are held
+asynchronously, so this works for actions that themselves use the event
+loop.  See ["cache\_single\_flight"](#cache_single_flight) for the failure and timeout behaviour.
 
 Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
 `$c->stash(buffer => {cache => undef})` before calling it.
+
+#### Arguments
+
+- `$c` (implicit)
+
+    The controller the helper is called on.
+
+#### Returns
+
+True when the response has been, or will be, sent by the plugin: a cache
+hit, or a request now waiting for another one to build the entry.  False
+when the action must do its work: a miss, a bypassed request, no cache, or a
+cache that failed.
+
+#### Side Effects
+
+- On a hit: sets the status, headers and body and finishes the
+response.
+- On a miss: sets `X-Cache: MISS`, and the response is stored in the
+cache when it is complete.
+- When waiting: calls `render_later`; the response is finished later
+from the event loop, with the entry or with `503 Service Unavailable`.
+- May take a shared lock through ["cache\_lock"](#cache_lock), released when the
+response is complete or after ["cache\_lock\_timeout"](#cache_lock_timeout).
+
+#### Example
+
+```perl
+use Mojolicious::Lite;
+use CHI;
+
+plugin 'Buffer' => {cache => CHI->new(driver => 'Memory', global => 1)};
+
+get '/report' => sub {
+    my $c = shift;
+    return if $c->buffer_is_cached;
+
+    # Only reached on a miss
+    $c->render(text => expensive_report());
+};
+```
+
+#### Api Specification
+
+##### Input
+
+```perl
+{ c => { type => 'object', isa => 'Mojolicious::Controller' } }
+```
+
+##### Output
+
+```perl
+# Return::Set schema
+{ type => 'boolean' }
+```
+
+#### Messages
+
+The helper never croaks.  It logs:
+
+```
+Key                     Level  Meaning
+----------------------  -----  -------------------------------------------------
+log_cache_hit           debug  The response was replayed from the cache
+log_cache_get_failed    error  The cache's get() died; the action runs normally
+log_stale_entry         debug  The entry predates the application or a template
+log_building            debug  This request will build the entry
+log_waiting             debug  This request waits for another one in the worker
+log_waiting_worker      debug  This request waits for another worker
+log_lock_failed         error  The lock backend failed; a local flight is used
+log_gave_up             debug  The wait timed out; a 503 was sent
+log_finish_waiter_failed error Replaying to a waiting request failed
+```
+
+#### Formal Specification
+
+```
+┌─ BufferIsCached ────────────────────────────
+│ ΔPlugin ; ΔResponse
+│ c? : Controller ; result! : 𝔹
+├─────────────────────────────────────────────
+│ let k == key(c?) •
+│   cacheable(c?) ∧ k ∈ dom cache ∧ fresh(cache k) ⇒
+│       response′ = replay(cache k) ∧ result! = true
+│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ dom inflight ∧ singleFlight ⇒
+│       waiters′(k) = waiters(k) ∪ {c?} ∧ result! = true
+│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ held(lock) ∧ singleFlight ⇒
+│       polling′ = polling ∪ {(c?, k)} ∧ result! = true
+│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∉ dom inflight ⇒
+│       (singleFlight ⇒ k ∈ dom inflight′) ∧ result! = false
+│   ¬cacheable(c?) ⇒ result! = false
+└─────────────────────────────────────────────
+```
+
+#### Pseudocode
+
+```perl
+if the plugin is off for this response, return false
+if this request was already replayed or is already waiting, return true
+if this request is already building an entry, return false
+if there is no cache or the request may not use it, return false
+mark the request so the finished response is stored
+work out the key and look the entry up
+if the cache failed, return false
+if there is no fresh entry:
+    set X-Cache: MISS
+    if single-flight is off, return false
+    if this worker is already building the key, wait for it, return true
+    if a lock backend says another worker is building it, poll, return true
+    start a flight for the key (holding the lock if one was taken)
+    return false
+replay the entry and return true
+```
+
+### i18n
+
+```perl
+my $text = $plugin->i18n('retry_later');
+```
+
+#### Purpose
+
+Look a message up in the catalog, applying the ["messages"](#messages) option.  It is
+the method from [Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N), imported so that the
+plugin and its backends share one implementation; that module documents it
+in full.
+
+#### Arguments
+
+`$key`, a message key, and an optional hash of placeholder values.
+
+#### Returns
+
+The text of the message, or the key itself if it is unknown.
+
+#### Side Effects
+
+None.
+
+#### Example
+
+```perl
+my $plugin = $app->plugin('Buffer', messages => {log_cache_hit => 'HIT %{key}'});
+say $plugin->i18n('log_cache_hit', {key => 'buffer:abc'});   # HIT buffer:abc
+```
+
+#### Api Specification
+
+##### Input
+
+```perl
+{
+    key  => { type => 'string', min => 1 },
+    args => { type => 'hashref', optional => 1 },
+}
+```
+
+##### Output
+
+```perl
+# Return::Set schema
+{ type => 'string' }
+```
+
+#### Messages
+
+See ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n).
+
+#### Formal Specification
+
+See ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n); here `overrides` is the
+["messages"](#messages) option.
 
 ## Deployment
 
@@ -618,8 +1017,8 @@ sub startup {
 1;
 ```
 
-A runnable copy of this example, with its paths under `eg/hypnotoad`, is
-included as `eg/hypnotoad`.
+A runnable copy of this example, with its paths under `examples/hypnotoad`,
+is included as `examples/hypnotoad`.
 
 `script/my_app` is the usual launcher:
 
@@ -742,6 +1141,11 @@ run out rather than sleeping a fixed margin; set `MPB_REDIS_TTL` to widen
 that further on a heavily loaded machine.  The normal test suite does not
 require a Redis server.
 
+The private routines are guarded by [Sub::Private](https://metacpan.org/pod/Sub%3A%3APrivate) in `enforce` mode and
+[Sub::Protected](https://metacpan.org/pod/Sub%3A%3AProtected).  Both stand aside while `HARNESS_ACTIVE` is set, so the
+white-box tests can reach them under `prove`; `t/16-encapsulation.t` turns
+that bypass off to check the guards themselves.
+
 ### Why a Plugin?
 
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) replaces `STDOUT` with an in-memory buffer and does its work
@@ -771,10 +1175,13 @@ generation feature rather than a response filter and is not part of this
 plugin.  The server-side cache is available as the opt-in
 ["buffer\_is\_cached"](#buffer_is_cached) helper described above.
 
-## Caveats
+## Limitations
 
 - Only in-memory responses are processed.  Static files
 (`Mojo::Asset::File`) and streaming responses are left alone.
+- The whole response is held in memory, more than once while it is
+being optimised and compressed.  There is no size limit; a very large
+generated body costs several times its size in a worker.
 - Responses that already have a `Content-Encoding`, for example from
 `$app->renderer->compress`, are not compressed again.
 - Gzip, Brotli, Zstandard and identity representations have different
@@ -784,9 +1191,16 @@ for each coding.
 - Because the body is buffered, the plugin must not be used for
 responses that are streamed with `$c->write` (server-sent events,
 long-polling and so on).  `text/event-stream` is excluded by default.
-- Optimising HTML rewrites the document.  Use
-`optimise_content => 0` on pages where every byte matters to scripts, or
-disable it per response with `$c->stash(buffer => {optimise_content => 0})`.
+- The HTML optimiser is a set of regular expressions inherited from
+[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), not an HTML parser.  It protects the content of
+`<pre>`, `<textarea>`, `<script>` and
+`<style>`, but white space made significant by CSS
+(`white-space: pre` on another element) is still collapsed, and some rules
+(for example merging adjacent `<center>` blocks) change the
+document slightly.  Use `optimise_content => 0` on pages where every
+byte matters, or disable it per response with
+`$c->stash(buffer => {optimise_content => 0})`.  Link rewriting
+only recognises double-quoted attributes.
 - The server-side cache is opt-in: a page is only stored if its action
 calls ["buffer\_is\_cached"](#buffer_is_cached).  An action that forgets to call it is never
 cached, and an action that calls it for a personalised page must supply a
@@ -800,18 +1214,36 @@ analytics cookie on every visit will get little sharing; use
 keeps its own in-flight table, so a cold entry can be built once per worker;
 set ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to coalesce across workers, with a
 shared cache.  A request waiting on an in-flight response is answered with
-`503` if that
-response fails, cannot be cached, or exceeds ["cache\_lock\_timeout"](#cache_lock_timeout), rather
-than running the action a second time.
+`503` if that response fails, cannot be cached, or exceeds
+["cache\_lock\_timeout"](#cache_lock_timeout), rather than running the action a second time.  A
+waiter in another worker polls the cache every 100 milliseconds, so it can
+be answered up to that much later than the builder finishes.
 - Entries are invalidated when the application script or a template
 path changes, but not when data or configuration changes.  The TTL is the
 backstop for those.
+- Options in the `buffer` stash and group declarations are not
+validated the way `plugin()` options are.  A bad `cache_lock_timeout`
+there falls back to the default; other bad values are used as given.
+- The lock backend protocol returns two-element lists rather than
+references.  That is the documented interface third-party backends already
+implement, so it was kept.
+- Every private routine is wrapped by [Sub::Private](https://metacpan.org/pod/Sub%3A%3APrivate) or
+[Sub::Protected](https://metacpan.org/pod/Sub%3A%3AProtected), which costs a `caller` check on each call.  The plugin
+makes a few hundred such calls per response, which is small next to MD5,
+compression and template rendering, but it is not free.  The modules also
+add [Readonly](https://metacpan.org/pod/Readonly), [Params::Validate::Strict](https://metacpan.org/pod/Params%3A%3AValidate%3A%3AStrict) and their dependencies to what
+was a Mojolicious-only plugin, and `use autodie qw(:all)` requires
+[IPC::System::Simple](https://metacpan.org/pod/IPC%3A%3ASystem%3A%3ASimple) even though the plugin never runs an external
+command.
+- The `503` text is chosen per application through ["messages"](#messages); it
+is not negotiated from `Accept-Language`.
 
 ## See Also
 
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker),
 [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin), [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
-[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis),
+[Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N)
 
 ## Author
 

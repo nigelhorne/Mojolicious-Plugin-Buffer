@@ -1,24 +1,116 @@
 package Mojolicious::Plugin::Buffer;
 
+use strict;
+use warnings;
+use autodie qw(:all);
+
 use Mojo::Base 'Mojolicious::Plugin';
 
 use Carp qw(croak);
-use Encode ();
 use File::Spec ();
 use Mojo::Date;
 use Mojo::IOLoop;
-use Mojo::Util qw(gzip md5_sum);
+use Mojo::Loader qw(load_class);
+use Mojo::Util qw(encode gzip md5_sum split_header trim);
+use Mojolicious::Plugin::Buffer::I18N qw(i18n);
 use Mojolicious::Plugin::Buffer::Lock::File;
-use Scalar::Util qw(blessed refaddr);
+use Params::Get qw(get_params);
+use Params::Validate::Strict qw(validate_strict);
+use Readonly;
+use Return::Set qw(set_return);
+use Scalar::Util qw(looks_like_number refaddr);
+use Sub::Private { mode => 'enforce' };
+use Sub::Protected;
 use Time::HiRes ();
 
 use version; our $VERSION = version->declare('0.001.0');
 
+# ---------------------------------------------------------------------------
+# Constants.  Nothing below this block should contain a bare number or a
+# protocol string; if it does, it belongs up here.
+# ---------------------------------------------------------------------------
+
+# HTTP status codes the plugin reasons about
+Readonly::Scalar my $HTTP_MIN_FINAL => 200;	# below this, an interim response
+Readonly::Scalar my $HTTP_OK => 200;
+Readonly::Scalar my $HTTP_NOT_MODIFIED => 304;
+Readonly::Scalar my $HTTP_UNAVAILABLE => 503;
+
+# No Content, Partial Content and Not Modified carry no entity to rework
+Readonly::Hash my %BODYLESS_STATUS => map { $_ => 1 } (204, 206, 304);
+
+# Only these methods are revalidated and cached
+Readonly::Hash my %SAFE_METHODS => map { $_ => 1 } qw(GET HEAD);
+
+# Only these media types are rewritten by the HTML optimiser
+Readonly::Hash my %HTML_TYPES => map { $_ => 1 } qw(text/html application/xhtml+xml);
+
+# Cache-Control directives that stop a request using, or a response being
+# stored in, the server-side cache.  max-age only counts when it is zero.
+Readonly::Hash my %REQUEST_NO_CACHE => map { $_ => 1 } qw(no-store no-cache private max-age);
+Readonly::Hash my %RESPONSE_NO_STORE => map { $_ => 1 } qw(no-store private);
+
+# Headers that describe one delivery rather than the page, so they are never
+# stored with a cache entry
+Readonly::Hash my %UNSTORED_HEADERS => map { lc($_) => 1 } qw(
+	Connection Content-Encoding Content-Length Date ETag Keep-Alive
+	Last-Modified Server Set-Cookie Transfer-Encoding X-Cache
+);
+
+# Response header that reports what the cache did
+Readonly::Scalar my $X_CACHE => 'X-Cache';
+Readonly::Scalar my $HIT => 'HIT';
+Readonly::Scalar my $MISS => 'MISS';
+
+# Prefixes keep our keys apart from anything else in a shared cache
+Readonly::Scalar my $KEY_PREFIX => 'buffer:';
+Readonly::Scalar my $MTIME_KEY_PREFIX => 'buffer:template-mtime:';
+
+# Timings, in seconds
+Readonly::Scalar my $DEFAULT_LOCK_TIMEOUT => 10;
+Readonly::Scalar my $DEFAULT_MTIME_DURATION => 10;
+Readonly::Scalar my $DEFAULT_CACHE_DURATION => '10 minutes';
+Readonly::Scalar my $MIN_WAITER_DELAY => 0.05;	# a waiter always gets one tick
+Readonly::Scalar my $SHARED_POLL_INTERVAL => 0.1;	# how often a cross-worker waiter looks
+Readonly::Scalar my $RETRY_AFTER => 1;
+
+Readonly::Scalar my $DEFAULT_MIN_COMPRESS_SIZE => 32;
+Readonly::Scalar my $OPTIMISE_AGGRESSIVE => 2;	# optimise_content level that touches JavaScript
+
+# Stash keys.  'buffer' is the documented per-response override; the
+# dotted ones are private bookkeeping; mojo.finished belongs to Mojolicious.
+Readonly::Scalar my $STASH_OVERRIDE => 'buffer';
+Readonly::Scalar my $STASH_FLIGHT => 'buffer.flight';
+Readonly::Scalar my $STASH_STORED => 'buffer.stored';
+Readonly::Scalar my $STASH_FROM_CACHE => 'buffer.from_cache';
+Readonly::Scalar my $STASH_WAITER => 'buffer.cache_waiter';
+Readonly::Scalar my $STASH_CHECKED => 'buffer.cache_checked';
+Readonly::Scalar my $STASH_KEY => 'buffer.cache_key';
+Readonly::Scalar my $STASH_MTIME => 'buffer.application_mtime';
+Readonly::Scalar my $STASH_FINISHED => 'mojo.finished';
+
+# Content codings: how to produce each one, which optional module it needs,
+# and the legacy names clients still send
+Readonly::Hash my %ENCODERS => (
+	gzip => sub { gzip($_[0]) },
+	br => sub { require IO::Compress::Brotli; IO::Compress::Brotli::bro($_[0]) },
+	zstd => sub { require Compress::Zstd; Compress::Zstd::compress(\$_[0]) },
+);
+Readonly::Hash my %ENCODING_MODULE => (br => 'IO::Compress::Brotli', zstd => 'Compress::Zstd');
+Readonly::Hash my %ENCODING_ALIAS => ('x-gzip' => 'gzip');
+
+# Same-site links rewritten by rewrite_links, as [element, attribute]
+Readonly::Array my @LINK_ATTRIBUTES => (['a', 'href'], ['img', 'src']);
+
+# Elements whose content is significant white space or code, which the
+# white-space squasher must never touch
+Readonly::Scalar my $VERBATIM_ELEMENT => qr{(<(pre|textarea|script|style)\b[^>]*>)(.*?)(</\2\s*>)}is;
+
 # Server preference order for content codings
-my @DEFAULT_ENCODINGS = qw(br zstd gzip);
+Readonly::Array my @DEFAULT_ENCODINGS => qw(br zstd gzip);
 
 # Media types worth compressing
-my @DEFAULT_COMPRESSIBLE_TYPES = (
+Readonly::Array my @DEFAULT_COMPRESSIBLE_TYPES => (
 	qr{^text/},
 	qr{^application/(?:ecmascript|javascript|json|ld\+json|xhtml\+xml|xml)$},
 	qr{^image/svg\+xml$},
@@ -26,35 +118,89 @@ my @DEFAULT_COMPRESSIBLE_TYPES = (
 
 # Types that must never be buffered and compressed, even though they
 # match one of the rules above
-my @DEFAULT_EXCLUDED_TYPES = (
-	qr{^text/event-stream$},
-);
+Readonly::Array my @DEFAULT_EXCLUDED_TYPES => (qr{^text/event-stream$});
 
-my %DEFAULTS = (
-	compress_content   => 1,	# compress responses with gzip/br/zstd
-	optimise_content   => 0,	# 1 = squash HTML, 2 = also be aggressive with JavaScript
-	rewrite_links      => 1,	# make same-site absolute links relative
-	generate_etag      => 1,
-	generate_304       => 1,
+# Every option and its default.  register() shallow-copies the array
+# references, because Readonly makes nested data read-only too.
+Readonly::Hash my %DEFAULTS => (
+	compress_content => 1,	# compress responses with gzip/br/zstd
+	optimise_content => 0,	# 1 = squash HTML, 2 = also be aggressive with JavaScript
+	rewrite_links => 1,	# make same-site absolute links relative
+	generate_etag => 1,
+	generate_304 => 1,
 	trust_last_modified => 0,	# also answer If-Modified-Since when an ETag exists
-	last_modified      => 1,	# 0 = off, 1 = newest app/template mtime, epoch, date string or coderef
+	last_modified => 1,	# 0 = off, 1 = newest app/template mtime, epoch, date string or coderef
 	template_mtime_cache => undef,	# cache object for the template mtime scan
-	template_mtime_cache_duration => 10,	# seconds to keep a cached template mtime
-	min_compress_size  => 32,
-	encodings          => [@DEFAULT_ENCODINGS],
+	template_mtime_cache_duration => $DEFAULT_MTIME_DURATION,
+	min_compress_size => $DEFAULT_MIN_COMPRESS_SIZE,
+	encodings => [@DEFAULT_ENCODINGS],
 	compressible_types => [@DEFAULT_COMPRESSIBLE_TYPES],
-	excluded_types     => [@DEFAULT_EXCLUDED_TYPES],
-	cache              => undef,	# a CHI-like cache object
-	cache_duration     => '10 minutes',
-	cache_key          => undef,	# string or coderef, overriding the generated key
+	excluded_types => [@DEFAULT_EXCLUDED_TYPES],
+	cache => undef,	# a CHI-like cache object
+	cache_duration => $DEFAULT_CACHE_DURATION,
+	cache_key => undef,	# string or coderef, overriding the generated key
 	cache_single_flight => 1,	# let one request build a missing entry, others wait
-	cache_lock_timeout => 10,	# seconds before waiters give up
-	cache_lock         => undef,	# pluggable lock backend object
-	cache_lock_dir     => undef,	# directory of shared lock files, for multiple workers
-	vary_by            => ['cookie'],	# request headers that become part of the cache key
+	cache_lock_timeout => $DEFAULT_LOCK_TIMEOUT,	# seconds before waiters give up
+	cache_lock => undef,	# pluggable lock backend object
+	cache_lock_dir => undef,	# directory of shared lock files, for multiple workers
+	vary_by => ['cookie'],	# request headers that become part of the cache key
+	messages => undef,	# overrides for the message catalog
 );
 
-my %KNOWN_OPTION = map { $_ => 1 } keys %DEFAULTS;
+# Params::Validate::Strict schema for each option.  The keys of this hash
+# are the complete list of options; anything else is rejected.
+Readonly::Scalar my $FLAG => {type => 'scalar', optional => 1};
+Readonly::Scalar my $DURATION => {type => 'string', min => 1, optional => 1};
+Readonly::Hash my %OPTION_SCHEMA => (
+	compress_content => $FLAG,
+	optimise_content => {type => 'integer', min => 0, max => $OPTIMISE_AGGRESSIVE, optional => 1},
+	rewrite_links => $FLAG,
+	generate_etag => $FLAG,
+	generate_304 => $FLAG,
+	trust_last_modified => $FLAG,
+	last_modified => [{type => 'scalar'}, {type => 'coderef'}],
+	template_mtime_cache => {type => 'object', can => [qw(get set)], optional => 1},
+	template_mtime_cache_duration => $DURATION,
+	min_compress_size => {type => 'integer', min => 0},
+	encodings => {type => 'arrayref'},
+	compressible_types => {type => 'arrayref'},
+	excluded_types => {type => 'arrayref'},
+	cache => {type => 'object', can => [qw(get set remove)], optional => 1},
+	cache_duration => $DURATION,
+	cache_key => [{type => 'string'}, {type => 'coderef'}],
+	cache_single_flight => $FLAG,
+	cache_lock_timeout => {
+		type => 'number',
+		matches => qr/^\d+(?:\.\d+)?$/,
+		callback => sub { $_[0] > 0 },
+		optional => 1,
+	},
+	cache_lock => {type => 'object', can => [qw(acquire release)], optional => 1},
+	cache_lock_dir => {type => 'string', min => 1, optional => 1},
+	vary_by => {
+		type => 'arrayref',
+		callback => sub { !grep { !defined($_) || ref($_) || !length($_) } @{$_[0]} },
+	},
+	messages => {type => 'hashref', optional => 1},
+);
+
+# Options whose error message is shared; every other option has its own
+# option_<name> message, falling back to option_invalid
+Readonly::Hash my %OPTION_MESSAGE => map { $_ => 'option_flag' }
+	qw(compress_content rewrite_links generate_etag generate_304 trust_last_modified cache_single_flight);
+
+# Options that can be declared for a group of pages, either as a route
+# default, which lands in the stash,
+#     $r->get('/about' => {trust_last_modified => 1} => sub {...});
+#     $r->under('/docs')->to(optimise_content => 1);
+# or by the controller itself, which its namespace inherits:
+#     sub buffer_optimise_content { 1 }
+Readonly::Array my @GROUP_OPTIONS => qw(compress_content optimise_content rewrite_links trust_last_modified);
+
+# Whether each optional module loads, remembered for the life of the process
+my %AVAILABLE;
+
+=encoding utf8
 
 =head1 NAME
 
@@ -163,9 +309,11 @@ that were built with C<$c-E<gt>res-E<gt>body> rather than C<$c-E<gt>render>.
 =head1 OPTIONS
 
 All options can be given to C<plugin()> and, except where noted, overridden
-per request through the C<buffer> stash value.  A few describe a section of a
-site rather than one page and can be declared once for it; see
-L</Declaring options for a group of pages>.
+per request through the C<buffer> stash value.  Options given to C<plugin()>
+are validated when the plugin is registered; values in the C<buffer> stash
+are not, and an unusable one falls back to its default where that is safe.
+A few options describe a section of a site rather than one page and can be
+declared once for it; see L</Declaring options for a group of pages>.
 
 =head2 Declaring options for a group of pages
 
@@ -186,7 +334,8 @@ a C<before_action> that sets one work as well.  The controller form is a
 method named C<buffer_> followed by the option name, and is only consulted
 when the stash says nothing: C<has> is the declarative way to write it, and a
 plain C<sub buffer_optimise_content { 1 }> covers a value that depends on the
-request.
+request.  A controller method that dies is logged at debug level and
+ignored, so the plugin option stays in force.
 
 The most specific declaration wins:
 
@@ -226,8 +375,8 @@ Everything else, including L</generate_etag> and L</generate_304>, stays a
 per-response or per-application decision; those sections say why.  Any option
 can still be set for one response through the C<buffer> stash.
 
-F<eg/grouped-sections> is a runnable site with one section declared on an
-C<under> route and one declared in a controller.
+F<examples/grouped-sections> is a runnable site with one section declared on
+an C<under> route and one declared in a controller.
 
 =head2 compress_content
 
@@ -242,7 +391,8 @@ that serves files it has already compressed.
 
 =head2 optimise_content
 
-How hard to optimise HTML, defaults to 0 (off):
+How hard to optimise HTML, defaults to 0 (off).  Registration rejects any
+value other than 0, 1 or 2:
 
 =over 4
 
@@ -258,10 +408,13 @@ C<E<lt>!-- ... --E<gt>> hiding technique
 =back
 
 Optimisation only applies to C<text/html> and C<application/xhtml+xml>
-responses.  L<HTML::Packer> is optional: without it the white-space
-squashing and link rewriting still run, but comments and embedded CSS and
-JavaScript are left alone, as they are by L<CGI::Buffer> and
-L<FCGI::Buffer>.  Install L<HTML::Packer> for the full effect.
+responses.  The content of C<E<lt>preE<gt>>, C<E<lt>textareaE<gt>>,
+C<E<lt>scriptE<gt>> and C<E<lt>styleE<gt>> elements is never touched by the
+white-space squashing, because white space there is significant.
+L<HTML::Packer> is optional: without it the white-space squashing and link
+rewriting still run, but comments and embedded CSS and JavaScript are left
+alone, as they are by L<CGI::Buffer> and L<FCGI::Buffer>.  Install
+L<HTML::Packer> for the full effect.
 
 It can be declared for a group of pages (see
 L</Declaring options for a group of pages>), for a static section that is
@@ -272,7 +425,8 @@ always minified.
 When optimising, rewrite C<E<lt>a hrefE<gt>> and C<E<lt>img srcE<gt>> links that
 point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
-Defaults to 1.  Has no effect unless L</optimise_content> is enabled.
+Defaults to 1.  Has no effect unless L</optimise_content> is enabled.  Only
+double-quoted attribute values are recognised.
 
 It can be declared for a group of pages (see
 L</Declaring options for a group of pages>), which matters for a section
@@ -285,7 +439,8 @@ elsewhere.
 Add an C<ETag> header to C<200> responses to C<GET> and C<HEAD> requests,
 defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
-representation of the same page have different tags.
+representation of the same page have different tags.  An C<ETag> set by the
+action is kept.
 
 It is not declarable for a group of pages (see
 L</Declaring options for a group of pages>): whether a digest is worth
@@ -335,13 +490,15 @@ May be:
 
 =item a date string - anything L<Mojo::Date> can parse
 
-=item a coderef - called with the controller, returns any of the above
+=item a coderef - called with the controller, returns 0, 1, an epoch or a
+date string (a coderef returning another coderef is treated as 0)
 
 =back
 
 The value is ignored for responses that are not C<200> responses to
 C<GET> or C<HEAD> requests.  If C<If-None-Match> is present it takes
-precedence over C<If-Modified-Since>, as required by RFC 7232.
+precedence over C<If-Modified-Since>, as required by RFC 7232.  A
+C<Last-Modified> header set by the action is kept.
 
 The default is the newest mtime of the application file and the files and
 directories under the renderer's C<paths>, so editing a template changes
@@ -415,7 +572,7 @@ request.  A per-worker cache avoids the scan without sharing anything:
 
     use CHI;
     plugin 'Buffer' => {
-        template_mtime_cache => CHI->new(driver => 'Memory', datastore => {}),
+	template_mtime_cache => CHI->new(driver => 'Memory', datastore => {}),
     };
 
 A shared cache, such as CHI's File or Memcached driver, also avoids the scan
@@ -445,16 +602,18 @@ human-readable duration.
 
 =head2 min_compress_size
 
-Do not compress bodies smaller than this many bytes, defaults to 32.
-Compression is also skipped if it would not make the body smaller.
+Do not compress bodies smaller than this many bytes, defaults to 32.  Must be
+a non-negative integer.  Compression is also skipped if it would not make the
+body smaller.
 
 =head2 encodings
 
 An arrayref of the content codings to offer, in server preference order.
 Defaults to C<[qw(br zstd gzip)]>.  C<br> is only offered if
 L<IO::Compress::Brotli> is installed and C<zstd> only if L<Compress::Zstd>
-is installed; gzip is always available.  Clients pick with the usual
-quality values, and C<identity> is used when nothing acceptable is offered.
+is installed; gzip is always available.  C<x-gzip> is accepted as a synonym
+for C<gzip>.  Clients pick with the usual quality values, and C<identity> is
+used when nothing acceptable is offered.
 
 =head2 compressible_types
 
@@ -486,7 +645,9 @@ or a human-readable duration.
 
 A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
-when the response depends on something the default key does not cover.
+when the response depends on something the default key does not cover.  An
+empty string, or a coderef returning nothing, falls back to the generated
+key.
 
 =head2 cache_single_flight
 
@@ -522,7 +683,8 @@ workers that cannot share a directory.  It must implement:
 Return a truthy guard if the lock was acquired, C<(undef, undef)> if another
 process holds it, and C<(undef, $error)> if the backend failed.  On an error
 the plugin logs the message and continues with a per-worker flight, so a
-cache miss is still built.
+cache miss is still built.  An exception thrown by C<acquire> is treated as
+an error.
 
 The call is synchronous and runs before the action is allowed to continue.
 A backend must therefore be quick and must not depend on the event loop; an
@@ -535,7 +697,8 @@ asynchronous Redis client is not suitable.
 Release a guard returned by C<acquire>.  The guard is opaque to the plugin.
 Releasing a lock that has already expired is allowed.  If release fails, the
 lock should expire on its own; the backend can return C<(0, $error)> so the
-failure is logged.
+failure is logged.  A backend that returns nothing is treated as having
+released the lock.
 
 =back
 
@@ -550,7 +713,8 @@ the plugin is registered rather than per response.
 How long a request may wait for another request, in this worker or another
 one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
 long a key is considered to be in flight when the request building it never
-finishes.  Fractional seconds are allowed, so C<0.5> is valid.
+finishes.  Fractional seconds are allowed, so C<0.5> is valid; zero and
+negative values are rejected.
 
 =head2 cache_lock_dir
 
@@ -583,20 +747,272 @@ An arrayref of request header names that become part of the generated cache
 key.  Defaults to C<['cookie']>, which keeps one client's session from being
 served to another.  Set it to C<[]> for URL-only caching of pages that are
 identical for every visitor, or add e.g. C<'accept-language'> when the
-response varies by language.  Headers listed here may also appear in the
-response's C<Vary> header; a response that varies on anything else is not
-stored.
+response varies by language.  Header names are case-insensitive.  Headers
+listed here may also appear in the response's C<Vary> header; a response
+that varies on anything else is not stored.
+
+=head2 messages
+
+A hash reference of message overrides, keyed by message key, used for every
+error, log line and client-facing text the plugin produces, including the
+body of the C<503> sent to a request that gave up waiting.  See
+L<Mojolicious::Plugin::Buffer::I18N> for the keys, the placeholder syntax
+and plural and gender variants:
+
+    plugin 'Buffer' => {
+	messages => {
+	    retry_later => "Die Seite wird gerade erstellt, bitte versuchen Sie es gleich noch einmal.\n",
+	},
+    };
+
+It is passed to the lock backend built from L</cache_lock_dir>.  It is read
+when the plugin is registered, not per response.
 
 =head1 METHODS
 
 C<Mojolicious::Plugin::Buffer> inherits all methods from
-L<Mojolicious::Plugin> and implements the following new one.  It also adds
+L<Mojolicious::Plugin> and implements the following new ones.  It also adds
 the L</buffer_is_cached> helper to the application.
 
 =head2 register
 
-    $plugin->register(Mojolicious->new, {optimise_content => 1});Register the plugin, usually through C<$app-E<gt>plugin('Buffer', ...)>.
-Croaks if an unknown option is given or an option has the wrong shape.
+    $plugin->register(Mojolicious->new, {optimise_content => 1});
+
+=head3 Purpose
+
+Validate the options, install the C<after_dispatch> hook that reworks every
+response, and add the L</buffer_is_cached> helper.  It is normally called for
+you by C<< $app->plugin('Buffer', ...) >>.
+
+=head3 Arguments
+
+=over 4
+
+=item C<$app> (positional, required)
+
+The L<Mojolicious> application.
+
+=item C<\%options> (positional, optional)
+
+The options described under L</OPTIONS>, as a hash reference or a flat list.
+
+=back
+
+=head3 Returns
+
+The plugin object, so calls can be chained.
+
+=head3 Side effects
+
+=over 4
+
+=item * Turns off L<Mojolicious::Renderer/compress>, because this plugin does
+the compression; see L</Interaction with the renderer>.
+
+=item * Adds an C<after_dispatch> hook and a C<buffer_is_cached> helper.
+
+=item * Creates L</cache_lock_dir> if it is given and missing.
+
+=item * Loads the optional compression modules named by L</encodings>, and
+logs at debug level when L</optimise_content> is on without L<HTML::Packer>.
+
+=back
+
+=head3 Example
+
+    use Mojolicious::Lite;
+    use CHI;
+
+    plugin 'Buffer' => {
+	optimise_content => 1,
+	cache            => CHI->new(driver => 'File', root_dir => '/var/cache/myapp'),
+	cache_lock_dir   => '/var/lib/myapp/buffer-locks',
+	vary_by          => [],     # pages are the same for everyone
+    };
+
+    get '/' => sub {
+	my $c = shift;
+	return if $c->buffer_is_cached;
+	$c->render(text => 'Hello');
+    };
+
+    app->start;
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    # Params::Get::get_params(undef, @_) after $app, then one
+    # Params::Validate::Strict::validate_strict call per option
+    {
+	app                           => { type => 'object', can => [qw(hook helper renderer log)] },
+	compress_content              => { type => 'scalar', optional => 1 },
+	optimise_content              => { type => 'integer', min => 0, max => 2, optional => 1 },
+	rewrite_links                 => { type => 'scalar', optional => 1 },
+	generate_etag                 => { type => 'scalar', optional => 1 },
+	generate_304                  => { type => 'scalar', optional => 1 },
+	trust_last_modified           => { type => 'scalar', optional => 1 },
+	last_modified                 => [ { type => 'scalar' }, { type => 'coderef' } ],
+	template_mtime_cache          => { type => 'object', can => [qw(get set)], optional => 1 },
+	template_mtime_cache_duration => { type => 'string', min => 1, optional => 1 },
+	min_compress_size             => { type => 'integer', min => 0 },
+	encodings                     => { type => 'arrayref' },   # of br|zstd|gzip|x-gzip
+	compressible_types            => { type => 'arrayref' },   # of strings or qr//
+	excluded_types                => { type => 'arrayref' },   # of strings or qr//
+	cache                         => { type => 'object', can => [qw(get set remove)], optional => 1 },
+	cache_duration                => { type => 'string', min => 1, optional => 1 },
+	cache_key                     => [ { type => 'string' }, { type => 'coderef' } ],
+	cache_single_flight           => { type => 'scalar', optional => 1 },
+	cache_lock_timeout            => { type => 'number', optional => 1 },   # > 0
+	cache_lock                    => { type => 'object', can => [qw(acquire release)], optional => 1 },
+	cache_lock_dir                => { type => 'string', min => 1, optional => 1 },
+	vary_by                       => { type => 'arrayref' },   # of non-empty strings
+	messages                      => { type => 'hashref', optional => 1 },
+    }
+
+=head4 Output
+
+    # Return::Set schema
+    { type => 'object', isa => 'Mojolicious::Plugin::Buffer' }
+
+=head3 MESSAGES
+
+Every message croaks, from the caller's point of view.  The key is the
+L<Mojolicious::Plugin::Buffer::I18N> key that can be overridden.
+
+    Key                             Message (after "Mojolicious::Plugin::Buffer: ")     Resolution
+    ------------------------------  --------------------------------------------------  ---------------------------------
+    options_not_hash                options must be a hash reference                    Pass {...} or a key/value list
+    unknown_option                  unknown option 'NAME'                               Check the spelling in OPTIONS
+    option_flag                     NAME must be a true or false value                  Pass 0 or 1, not a reference
+    option_optimise_content         optimise_content must be 0, 1 or 2                  Use one of the documented levels
+    option_last_modified            last_modified must be 0, 1, an epoch, a date        Pass a scalar or a coderef
+                                    string or a code reference
+    option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 32
+    option_encodings                encodings must be an array reference                Pass [qw(br gzip)]
+    unknown_encoding                unknown encoding 'NAME'                             Use br, zstd, gzip or x-gzip
+    option_compressible_types       compressible_types must be an array reference       Pass [qr{^text/}, ...]
+    option_excluded_types           excluded_types must be an array reference           Pass [qr{^text/event-stream$}]
+    option_vary_by                  vary_by must be an array reference of header names  Pass e.g. ['cookie']
+    option_cache_key                cache_key must be a string or a code reference      Pass a string or sub
+    option_cache                    cache must be an object understanding get(), set()  Pass a CHI object
+                                    and remove()
+    option_cache_duration           cache_duration must be a duration                   Pass e.g. '10 minutes'
+    option_template_mtime_cache     template_mtime_cache must be an object              Pass a CHI object
+                                    understanding get() and set()
+    option_template_mtime_cache_duration
+                                    template_mtime_cache_duration must be a duration    Pass e.g. 10
+    option_cache_lock_timeout       cache_lock_timeout must be a positive number of     Pass e.g. 10 or 0.5
+                                    seconds
+    option_cache_lock               cache_lock must be an object with acquire() and     See cache_lock
+                                    release() methods
+    option_cache_lock_dir           cache_lock_dir must be a directory path             Pass a non-empty string
+    lock_options_combined           cache_lock and cache_lock_dir cannot be combined    Use one of the two
+    option_messages                 messages must be a hash reference                   Pass {key => 'text'}
+    lock_dir_create_failed          cannot create cache_lock_dir 'DIR': OS ERROR        See Lock::File
+    lock_dir_not_writable           cache_lock_dir 'DIR' is not a writable directory    See Lock::File
+
+A failure to validate C<$app> itself is reported by L<Params::Validate::Strict>
+and is not translated.
+
+=head3 FORMAL SPECIFICATION
+
+    [OPTION, VALUE, APP]
+
+    Known == dom Schema
+    Valid == { o : Known; v : VALUE | v ∈ Schema(o) }
+
+    ┌─ Plugin ────────────────────────────────────
+    │ options : OPTION ⇸ VALUE
+    │ inflight : KEY ⇸ Flight
+    │ lock : LockBackend ∪ {⊥}
+    ├─────────────────────────────────────────────
+    │ dom options = Known
+    │ ∀ o : dom options • (o, options o) ∈ Valid
+    └─────────────────────────────────────────────
+
+    ┌─ Register ──────────────────────────────────
+    │ ΔPlugin
+    │ app? : APP ; conf? : OPTION ⇸ VALUE ; result! : Plugin
+    ├─────────────────────────────────────────────
+    │ dom conf? ⊆ Known
+    │ ∀ o : dom conf? • (o, conf? o) ∈ Valid
+    │ ¬(cache_lock ∈ dom conf? ∧ cache_lock_dir ∈ dom conf?)
+    │ ran (conf? encodings) ⊆ {br, zstd, gzip, x-gzip}
+    │ options′ = Defaults ⊕ conf?
+    │ inflight′ = ∅
+    │ compress(renderer app?)′ = false
+    │ after_dispatch ∈ hooks(app?)′ ∧ buffer_is_cached ∈ helpers(app?)′
+    │ result! = θPlugin′
+    └─────────────────────────────────────────────
+
+    -- Any violated predicate: croak, app? is unchanged
+
+=head3 PSEUDOCODE
+
+    accept the options as a hash reference or a key/value list
+    check the application object
+    adopt the messages option first, so later errors can be reworded
+    start from the defaults
+    for each option given, in sorted order:
+        croak if it is unknown
+        croak with its own message if its value does not fit its schema
+    croak if both cache_lock and cache_lock_dir were given
+    build the lock backend: the given object, or a file backend for the dir
+    canonicalise encodings, croak on unknown ones, drop unavailable ones
+    log once if optimisation is on without HTML::Packer
+    turn off the renderer's own compression
+    hook after_dispatch to rework every response
+    add the buffer_is_cached helper
+    return the plugin
+
+=cut
+
+sub register {
+	my ($self, $app, @conf) = @_;
+
+	# Mojolicious passes a hash reference; Params::Get also accepts a list
+	my $conf = @conf ? eval { get_params(undef, @conf) } : {};
+	croak $self->i18n('options_not_hash') unless ref($conf) eq 'HASH';
+	validate_strict(
+		schema => {app => {type => 'object', can => [qw(hook helper renderer log)]}},
+		input => {app => $app},
+	);
+
+	# Messages first, so every later error can already be reworded
+	$self->{messages} = $conf->{messages} if ref($conf->{messages}) eq 'HASH';
+
+	# Sorted, so the same bad configuration always reports the same error
+	my %options = map { $_ => _copy_default($DEFAULTS{$_}) } keys %DEFAULTS;
+	for my $name (sort keys %$conf) {
+		croak $self->i18n('unknown_option', {option => $name}) unless exists($OPTION_SCHEMA{$name});
+		croak $self->i18n(_option_message($name), {option => $name}) unless _option_valid($name, $conf->{$name});
+		$options{$name} = $conf->{$name};
+	}
+
+	$self->{options} = \%options;
+	$self->{inflight} = {};
+	$self->{lock} = $self->_build_lock(\%options);
+	$options{encodings} = $self->_supported_encodings($options{encodings});
+
+	# HTML::Packer is optional: without it the white-space squashing and link
+	# rewriting still run, as they do in CGI::Buffer and FCGI::Buffer
+	$self->_log($app, debug => 'log_no_packer')
+		if $options{optimise_content} && !_module_available('HTML::Packer');
+
+	# Mojolicious::Renderer gzips rendered output by default, before this
+	# plugin ever sees it, which would stop optimisation and ETag generation
+	# from working on anything bigger than 860 bytes.  Take over that job.
+	$app->renderer->compress(0);
+
+	$app->hook(after_dispatch => sub { $self->_process(shift) });
+
+	# Opt-in server-side page cache, used from an action like this:
+	#     return if $c->buffer_is_cached;
+	$app->helper(buffer_is_cached => sub { $self->_is_cached(shift) });
+
+	return set_return($self, {type => 'object'});
+}
 
 =head2 buffer_is_cached
 
@@ -606,6 +1022,12 @@ Croaks if an unknown option is given or an option has the wrong shape.
 	# ... expensive work ...
 	$c->render(template => 'expensive');
     };
+
+=head3 Purpose
+
+A helper, added to the application by L</register>, that lets an action skip
+its work when a finished copy of the page is already cached, or when another
+request is already building it.
 
 Look for a cached response and, if there is one, replay its status, headers
 and body, add C<X-Cache: HIT>, finish the response and return true.  The
@@ -632,166 +1054,328 @@ is significant.
 Concurrent misses for the same key are coalesced within a worker, or across
 workers when L</cache_lock> or L</cache_lock_dir> is set: while one request
 is building an entry, later requests wait for it and replay the result
-instead of running the action again.  The waiting requests are held asynchronously, so this
-works for actions that themselves use the event loop.  See
-L</cache_single_flight> for the failure and timeout behaviour.
+instead of running the action again.  The waiting requests are held
+asynchronously, so this works for actions that themselves use the event
+loop.  See L</cache_single_flight> for the failure and timeout behaviour.
 
 Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
 C<< $c->stash(buffer => {cache => undef}) >> before calling it.
 
+=head3 Arguments
+
+=over 4
+
+=item C<$c> (implicit)
+
+The controller the helper is called on.
+
+=back
+
+=head3 Returns
+
+True when the response has been, or will be, sent by the plugin: a cache
+hit, or a request now waiting for another one to build the entry.  False
+when the action must do its work: a miss, a bypassed request, no cache, or a
+cache that failed.
+
+=head3 Side effects
+
+=over 4
+
+=item * On a hit: sets the status, headers and body and finishes the
+response.
+
+=item * On a miss: sets C<X-Cache: MISS>, and the response is stored in the
+cache when it is complete.
+
+=item * When waiting: calls C<render_later>; the response is finished later
+from the event loop, with the entry or with C<503 Service Unavailable>.
+
+=item * May take a shared lock through L</cache_lock>, released when the
+response is complete or after L</cache_lock_timeout>.
+
+=back
+
+=head3 Example
+
+    use Mojolicious::Lite;
+    use CHI;
+
+    plugin 'Buffer' => {cache => CHI->new(driver => 'Memory', global => 1)};
+
+    get '/report' => sub {
+	my $c = shift;
+	return if $c->buffer_is_cached;
+
+	# Only reached on a miss
+	$c->render(text => expensive_report());
+    };
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    { c => { type => 'object', isa => 'Mojolicious::Controller' } }
+
+=head4 Output
+
+    # Return::Set schema
+    { type => 'boolean' }
+
+=head3 MESSAGES
+
+The helper never croaks.  It logs:
+
+    Key                     Level  Meaning
+    ----------------------  -----  -------------------------------------------------
+    log_cache_hit           debug  The response was replayed from the cache
+    log_cache_get_failed    error  The cache's get() died; the action runs normally
+    log_stale_entry         debug  The entry predates the application or a template
+    log_building            debug  This request will build the entry
+    log_waiting             debug  This request waits for another one in the worker
+    log_waiting_worker      debug  This request waits for another worker
+    log_lock_failed         error  The lock backend failed; a local flight is used
+    log_gave_up             debug  The wait timed out; a 503 was sent
+    log_finish_waiter_failed error Replaying to a waiting request failed
+
+=head3 FORMAL SPECIFICATION
+
+    ┌─ BufferIsCached ────────────────────────────
+    │ ΔPlugin ; ΔResponse
+    │ c? : Controller ; result! : 𝔹
+    ├─────────────────────────────────────────────
+    │ let k == key(c?) •
+    │   cacheable(c?) ∧ k ∈ dom cache ∧ fresh(cache k) ⇒
+    │       response′ = replay(cache k) ∧ result! = true
+    │   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ dom inflight ∧ singleFlight ⇒
+    │       waiters′(k) = waiters(k) ∪ {c?} ∧ result! = true
+    │   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ held(lock) ∧ singleFlight ⇒
+    │       polling′ = polling ∪ {(c?, k)} ∧ result! = true
+    │   cacheable(c?) ∧ k ∉ dom cache ∧ k ∉ dom inflight ⇒
+    │       (singleFlight ⇒ k ∈ dom inflight′) ∧ result! = false
+    │   ¬cacheable(c?) ⇒ result! = false
+    └─────────────────────────────────────────────
+
+=head3 PSEUDOCODE
+
+    if the plugin is off for this response, return false
+    if this request was already replayed or is already waiting, return true
+    if this request is already building an entry, return false
+    if there is no cache or the request may not use it, return false
+    mark the request so the finished response is stored
+    work out the key and look the entry up
+    if the cache failed, return false
+    if there is no fresh entry:
+        set X-Cache: MISS
+        if single-flight is off, return false
+        if this worker is already building the key, wait for it, return true
+        if a lock backend says another worker is building it, poll, return true
+        start a flight for the key (holding the lock if one was taken)
+        return false
+    replay the entry and return true
+
+=head2 i18n
+
+    my $text = $plugin->i18n('retry_later');
+
+=head3 Purpose
+
+Look a message up in the catalog, applying the L</messages> option.  It is
+the method from L<Mojolicious::Plugin::Buffer::I18N>, imported so that the
+plugin and its backends share one implementation; that module documents it
+in full.
+
+=head3 Arguments
+
+C<$key>, a message key, and an optional hash of placeholder values.
+
+=head3 Returns
+
+The text of the message, or the key itself if it is unknown.
+
+=head3 Side effects
+
+None.
+
+=head3 Example
+
+    my $plugin = $app->plugin('Buffer', messages => {log_cache_hit => 'HIT %{key}'});
+    say $plugin->i18n('log_cache_hit', {key => 'buffer:abc'});   # HIT buffer:abc
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    {
+	key  => { type => 'string', min => 1 },
+	args => { type => 'hashref', optional => 1 },
+    }
+
+=head4 Output
+
+    # Return::Set schema
+    { type => 'string' }
+
+=head3 MESSAGES
+
+See L<Mojolicious::Plugin::Buffer::I18N/i18n>.
+
+=head3 FORMAL SPECIFICATION
+
+See L<Mojolicious::Plugin::Buffer::I18N/i18n>; here C<overrides> is the
+L</messages> option.
+
 =cut
 
-sub register {
-	my ($self, $app, $conf) = @_;
-	$conf ||= {};
+# ---------------------------------------------------------------------------
+# Registration helpers
+# ---------------------------------------------------------------------------
 
-	my %options = %DEFAULTS;
-	for my $key (keys %$conf) {
-		croak "Mojolicious::Plugin::Buffer: unknown option '$key'" unless $KNOWN_OPTION{$key};
-		$options{$key} = $conf->{$key};
-	}
+# Purpose:        Give register() its own copy of a default value.
+# Entry criteria: Any value from %DEFAULTS.
+# Exit status:    An unshared, writable array reference for an array
+#                 reference; anything else unchanged.
+# Side effects:   None.
+sub _copy_default :Private {
+	my $value = shift;
 
-	# Validate the shapes up front, rather than in the middle of a request
-	croak 'Mojolicious::Plugin::Buffer: encodings must be an array reference'
-		unless ref $options{encodings} eq 'ARRAY';
-	croak 'Mojolicious::Plugin::Buffer: compressible_types must be an array reference'
-		unless ref $options{compressible_types} eq 'ARRAY';
-	croak 'Mojolicious::Plugin::Buffer: excluded_types must be an array reference'
-		unless ref $options{excluded_types} eq 'ARRAY';
-	croak 'Mojolicious::Plugin::Buffer: vary_by must be an array reference'
-		unless ref $options{vary_by} eq 'ARRAY';
-	for my $name (@{$options{vary_by}}) {
-		croak 'Mojolicious::Plugin::Buffer: vary_by entries must be header names'
-			unless defined($name) && !ref($name) && length($name);
-	}
-	if (defined($options{cache_key}) && ref($options{cache_key}) && ref($options{cache_key}) ne 'CODE') {
-		croak 'Mojolicious::Plugin::Buffer: cache_key must be a string or a code reference';
-	}
-	if (defined(my $cache = $options{cache})) {
-		croak 'Mojolicious::Plugin::Buffer: cache must be an object understanding get(), set() and remove()'
-			unless blessed($cache) && $cache->can('get') && $cache->can('set') && $cache->can('remove');
-	}
-	if (defined(my $mtime_cache = $options{template_mtime_cache})) {
-		croak 'Mojolicious::Plugin::Buffer: template_mtime_cache must be an object understanding get() and set()'
-			unless blessed($mtime_cache) && $mtime_cache->can('get') && $mtime_cache->can('set');
-	}
-	if (defined($options{template_mtime_cache_duration}) &&
-	  (ref($options{template_mtime_cache_duration}) || !length($options{template_mtime_cache_duration}))) {
-		croak 'Mojolicious::Plugin::Buffer: template_mtime_cache_duration must be a duration';
-	}
-	if (defined($options{cache_lock_timeout}) &&
-	  (ref($options{cache_lock_timeout}) || $options{cache_lock_timeout} !~ /^\d+(?:\.\d+)?$/ || $options{cache_lock_timeout} <= 0)) {
-		croak 'Mojolicious::Plugin::Buffer: cache_lock_timeout must be a positive number of seconds';
-	}
-
-	# A lock backend makes single-flight work across worker processes.
-	# cache_lock_dir is a shorthand for the built-in file backend.
-	my $lock;
-	if (defined(my $backend = $options{cache_lock})) {
-		croak 'Mojolicious::Plugin::Buffer: cache_lock and cache_lock_dir cannot be combined'
-			if defined($options{cache_lock_dir});
-		croak 'Mojolicious::Plugin::Buffer: cache_lock must be an object with acquire() and release() methods'
-			unless blessed($backend) && $backend->can('acquire') && $backend->can('release');
-		$lock = $backend;
-	}
-	elsif (defined(my $dir = $options{cache_lock_dir})) {
-		$lock = Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir);
-	}
-
-	# Normalise and check the requested content codings
-	my @encodings;
-	for my $encoding (@{$options{encodings}}) {
-		my $name = lc $encoding;
-		$name = 'gzip' if $name eq 'x-gzip';
-		croak "Mojolicious::Plugin::Buffer: unknown encoding '$encoding'"
-			unless $name =~ /^(?:br|gzip|zstd)$/;
-		next if grep { $_ eq $name } @encodings;
-		next unless $name eq 'gzip' || _module_available($name);
-		push @encodings, $name;
-	}
-	$options{encodings} = \@encodings;
-
-	# HTML::Packer is optional: without it the white-space squashing and link
-	# rewriting still run, as they do in CGI::Buffer and FCGI::Buffer
-	if ($options{optimise_content} && !_module_available('HTML::Packer')) {
-		$app->log->debug('Buffer: HTML::Packer is not installed, optimising white space only');
-	}
-
-	# L<Mojolicious::Renderer> gzips rendered output by default, before this
-	# plugin ever sees it, which would stop optimisation and ETag generation
-	# from working on anything bigger than 860 bytes.  Take over that job.
-	$app->renderer->compress(0);
-
-	my $state = {options => \%options, inflight => {}, lock => $lock};
-
-	$app->hook(after_dispatch => sub {
-		my $c = shift;
-		return $self->_process($c, $state);
-	});
-
-	# Opt-in server-side page cache, used from an action like this:
-	#     return if $c->buffer_is_cached;
-	$app->helper(buffer_is_cached => sub {
-		my $c = shift;
-		return $self->_is_cached($c, $state);
-	});
-
-	return $self;
+	return (ref($value) eq 'ARRAY') ? [@$value] : $value;
 }
 
-my %MODULE_CHECK = (
-	'br' => sub { eval { require IO::Compress::Brotli; 1 } },
-	'zstd' => sub { eval { require Compress::Zstd; 1 } },
-	'HTML::Packer' => sub { eval { require HTML::Packer; 1 } },
-);
+# Purpose:        Check one option value against its schema.
+# Entry criteria: $name is a key of %OPTION_SCHEMA.
+# Exit status:    1 if the value is acceptable, 0 otherwise.
+# Side effects:   None; the validator's exception is discarded because
+#                 the caller reports a catalogued message instead.
+sub _option_valid :Private {
+	my ($name, $value) = @_;
 
-sub _module_available {
+	return eval { validate_strict(schema => {$name => $OPTION_SCHEMA{$name}}, input => {$name => $value}); 1 } ? 1 : 0;
+}
+
+# Purpose:        Find the catalog key that explains a bad option value.
+# Entry criteria: $name is a known option.
+# Exit status:    A message key that exists in the catalog.
+# Side effects:   None.
+sub _option_message :Private {
 	my $name = shift;
 
-	my $check = $MODULE_CHECK{$name}
-		or return 0;
+	my $key = $OPTION_MESSAGE{$name} // "option_$name";
+	return exists(Mojolicious::Plugin::Buffer::I18N->catalog->{$key}) ? $key : 'option_invalid';
+}
+
+# Purpose:        Choose the lock backend that makes single-flight span
+#                 worker processes.
+# Entry criteria: $options holds validated cache_lock/cache_lock_dir.
+# Exit status:    The backend object, or undef for per-worker flights.
+# Side effects:   Croaks if both were given; creates the lock directory.
+sub _build_lock :Private {
+	my ($self, $options) = @_;
+
+	my ($backend, $dir) = @{$options}{qw(cache_lock cache_lock_dir)};
+	croak $self->i18n('lock_options_combined') if defined($backend) && defined($dir);
+
+	# cache_lock_dir is a shorthand for the built-in file backend
+	return $backend // (defined($dir)
+		? Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir, messages => $self->{messages})
+		: undef);
+}
+
+# Purpose:        Turn the encodings option into the list actually offered.
+# Entry criteria: $requested is an array reference.
+# Exit status:    An array reference of canonical, unique, available codings
+#                 in the order given.
+# Side effects:   Croaks on an unknown coding; loads optional modules.
+sub _supported_encodings :Private {
+	my ($self, $requested) = @_;
+
+	my (@encodings, %seen);
+	for my $encoding (@$requested) {
+		my $name = _canonical_encoding($encoding);
+		croak $self->i18n('unknown_encoding', {encoding => $encoding // ''}) unless $ENCODERS{$name};
+
+		# Keep the first mention, and skip codings whose module is missing
+		next if $seen{$name}++;
+		next if $ENCODING_MODULE{$name} && !_module_available($ENCODING_MODULE{$name});
+		push @encodings, $name;
+	}
+
+	return \@encodings;
+}
+
+# Purpose:        Report whether an optional module can be loaded.
+# Entry criteria: $module is a package name.
+# Exit status:    1 if it loads, 0 if it is missing or fails to compile.
+# Side effects:   Loads the module; caches the answer for the process.
+sub _module_available :Private {
+	my $module = shift;
 
 	# An ambient $SIG{__DIE__} handler can swallow the die from an @INC hook
 	# (Test::Without::Module uses one), which makes a hidden module look
 	# loadable.  Probe with the default handler so the load decides.
 	local $SIG{__DIE__};
 
-	return $check->() ? 1 : 0;
+	# load_class returns undef on success, 1 if missing, or an exception
+	return $AVAILABLE{$module} //= load_class($module) ? 0 : 1;
 }
 
-# Options that can be declared for a group of pages, either as a route
-# default, which lands in the stash,
-#     $r->get('/about' => {trust_last_modified => 1} => sub {...});
-#     $r->under('/docs')->to(optimise_content => 1);
-# or by the controller itself, which its namespace inherits:
-#     sub buffer_optimise_content { 1 }
-my @GROUP_OPTIONS = qw(compress_content optimise_content rewrite_links trust_last_modified);
+# Purpose:        Write one catalogued line to the application log.
+# Entry criteria: $level is a Mojo::Log level; $key is a catalog key.
+# Exit status:    $self, for chaining.
+# Side effects:   Logs.  The message is built lazily, only if the level is
+#                 enabled, so debug lines cost nothing in production.
+sub _log :Private {
+	my ($self, $app, $level, $key, $args) = @_;
 
-sub _options_for {
-	my ($c, $state) = @_;
+	# Exceptions arrive with a trailing newline that would split the line
+	my %args = %{$args // {}};
+	$args{error} = trim("$args{error}") if defined($args{error});
 
-	my $override = $c->stash->{buffer};
-	return (undef, 1) if defined($override) && !ref($override) && !$override;
+	$app->log->$level(sub { $self->i18n($key, \%args) });
 
-	my $options = $state->{options};
-	$options = {%$options, %$override} if ref($override) eq 'HASH';
+	return $self;
+}
+
+# ---------------------------------------------------------------------------
+# Per-response options
+# ---------------------------------------------------------------------------
+
+# Purpose:        Work out the options that apply to this response.
+# Entry criteria: $c is the current controller.
+# Exit status:    A new hash reference of options, or undef when the
+#                 buffer stash is a false scalar (plugin off).
+# Side effects:   Calls buffer_<name> controller methods.
+sub _options_for :Private {
+	my ($self, $c) = @_;
+
+	my $override = $c->stash->{$STASH_OVERRIDE};
+	return undef if defined($override) && !ref($override) && !$override;
+
+	my %options = %{$self->{options}};
+	%options = (%options, %$override) if ref($override) eq 'HASH';
 
 	# A route default or a controller class can declare these for a whole
 	# group of pages, with the buffer stash still the most specific place to
 	# say otherwise
 	for my $name (@GROUP_OPTIONS) {
-		next if ref($override) eq 'HASH' && exists($override->{$name});
-		my $declared = _declared_option($c, $name);
-		$options = {%$options, $name => $declared} if defined($declared);
+		next if (ref($override) eq 'HASH') && exists($override->{$name});
+		my $declared = $self->_declared_option($c, $name);
+		$options{$name} = $declared if defined($declared);
 	}
 
-	return ($options, 0);
+	return \%options;
 }
 
-sub _declared_option {
-	my ($c, $name) = @_;
+# Purpose:        Read a group-level declaration for one option.
+# Entry criteria: $name is one of @GROUP_OPTIONS.
+# Exit status:    The declared scalar, or undef if nothing usable was
+#                 declared.
+# Side effects:   Calls the controller method; logs if it dies.
+sub _declared_option :Private {
+	my ($self, $c, $name) = @_;
 
+	# Route defaults and under routes land in the stash
 	my $stashed = $c->stash->{$name};
 	return $stashed if defined($stashed) && !ref($stashed);
 
@@ -802,264 +1386,355 @@ sub _declared_option {
 	if (my $error = $@) {
 		# A broken declaration must not take the response down with it; the
 		# plugin option stays in force instead
-		$error =~ s/\n+\z//;
-		$c->app->log->debug("Buffer: $method failed: $error");
+		$self->_log($c->app, debug => 'log_declaration_failed', {method => $method, error => $error});
 		return undef;
 	}
-	return undef if !defined($declared) || ref($declared);
 
-	return $declared;
+	return ref($declared) ? undef : $declared;
 }
 
-# Wrap the response pipeline so that a request which was building a cache
-# entry always releases the requests waiting for it, whether it succeeded,
-# failed, or produced something that must not be cached.
-sub _process {
-	my ($self, $c, $state) = @_;
+# ---------------------------------------------------------------------------
+# The after_dispatch pipeline
+# ---------------------------------------------------------------------------
 
-	my $flight = $c->stash->{'buffer.flight'};
-	my $ok = eval { $self->_process_response($c, $state); 1 };
+# Purpose:        The after_dispatch hook.  Wraps the response pipeline so
+#                 that a request which was building a cache entry always
+#                 releases the requests waiting for it, whether it
+#                 succeeded, failed, or produced something uncacheable.
+# Entry criteria: $c is the finished controller.
+# Exit status:    $self.  Re-throws any pipeline exception.
+# Side effects:   Rewrites the response; answers waiting requests.
+#                 Protected so a subclass can wrap it.
+sub _process :Protected {
+	my ($self, $c) = @_;
+
+	my $flight = $c->stash->{$STASH_FLIGHT};
+	my $ok = eval { $self->_process_response($c); 1 };
 	my $error = $@;
 
 	if ($flight) {
-		my $released = eval {
-			_release_flight($c->app, $state, $flight, $c->stash->{'buffer.stored'});
-			1;
-		};
-		$c->app->log->error("Buffer: could not release waiting requests: $@") unless $released;
+		eval { $self->_release_flight($c->app, $flight, $c->stash->{$STASH_STORED}); 1 }
+			or $self->_log($c->app, error => 'log_release_failed', {error => $@});
 	}
 
+	# Re-throw unchanged.  croak() is deliberately not used: it would append
+	# a second "at FILE line N" to a message that already has one.
 	die $error unless $ok;
-	return;
+
+	return $self;
 }
 
-sub _process_response {
-	my ($self, $c, $state) = @_;
+# Purpose:        Optimise, compress, cache and validate one response.
+# Entry criteria: $c is the finished controller.
+# Exit status:    $self.
+# Side effects:   May replace the body and set Content-Encoding, Vary,
+#                 ETag, Last-Modified and Content-Length; may store the
+#                 response in the cache; may turn it into a 304.
+sub _process_response :Private {
+	my ($self, $c) = @_;
 
-	my ($options, $disabled) = _options_for($c, $state);
-	return if $disabled;
-
-	my $stash = $c->stash;
-	my $from_cache = $stash->{'buffer.from_cache'};
-
+	my $options = $self->_options_for($c) or return $self;
 	my $res = $c->res;
-	my $code = $res->code || 0;
-	return if $code && (($code < 200) || ($code == 204) || ($code == 206) || ($code == 304));
 
-	my $headers = $res->headers;
+	# Only an in-memory, unencoded body with a known media type is ours
+	my $body = _buffered_body($res) // return $self;
+	my $type = _mime_type($res->headers->content_type);
+	return $self if !defined($type) || _matches($type, $options->{excluded_types});
 
-	# Someone else has already encoded the body, e.g. $app->renderer->compress
-	return if $headers->content_encoding;
-
-	my $content = $res->content;
-	return if $content->is_multipart || $content->is_dynamic;
-
-	# Never slurp files, they are streamed from disk and are not our business
-	my $asset = $content->asset;
-	return if $asset->is_file;
-
-	my $body = $asset->slurp;
-	return unless defined($body) && length($body);
-
-	my $content_type = _mime_type($headers->content_type);
-	return unless defined($content_type);
-	return if _matches($content_type, $options->{excluded_types});
-
-	my $compressible = _matches($content_type, $options->{compressible_types});
-
-	if (!$from_cache && $options->{optimise_content} &&
-	  (($content_type eq 'text/html') || ($content_type eq 'application/xhtml+xml'))) {
-		my $optimised = $self->_optimise($body, $c, $options);
-		if (defined($optimised) && (length($optimised) < length($body))) {
-			$c->app->log->debug('Buffer: optimised HTML from ', length($body), ' to ', length($optimised), ' bytes');
-			$body = $optimised;
-		}
-	}
+	# A replayed entry was optimised before it was stored
+	my $from_cache = $c->stash->{$STASH_FROM_CACHE};
+	$body = $self->_optimise_html($c, $options, $type, $body) unless $from_cache;
 
 	# The ETag is calculated from the unencoded entity plus the content coding,
 	# so gzip's changing timestamp can never alter it
 	my $entity = $body;
 	utf8::encode($entity) if utf8::is_utf8($entity);
 
-	my $encoding;
-	if ($options->{compress_content} && $compressible) {
-		_add_vary($headers);
-
-		my $wanted = _negotiate_encoding($c->req->headers->accept_encoding, $options->{encodings});
-		if (defined($wanted) && (length($entity) >= $options->{min_compress_size})) {
-			my ($compressed, $error) = _encode_body($wanted, $entity);
-			if (defined($compressed)) {
-				if (length($compressed) < length($entity)) {
-					$encoding = $wanted;
-					$body = $compressed;
-					$headers->content_encoding($encoding);
-					$c->app->log->debug("Buffer: compressed with $encoding from ", length($entity), ' to ', length($compressed), ' bytes');
-				}
-			} elsif ($error) {
-				$c->app->log->error("Buffer: $wanted compression failed: $error");
-			}
-		}
-	}
-	$body = $entity unless defined($encoding);
+	my $encoded = _matches($type, $options->{compressible_types})
+		? $self->_compress($c, $options, $entity)
+		: undef;
 
 	# Populate the server-side cache with the unencoded entity, so that each
 	# client still gets its own content coding and conditional response
-	_store_in_cache($c, $options, $entity, $code)
-		if !$from_cache && $stash->{'buffer.cache_checked'};
+	my $code = $res->code || 0;
+	$self->_store_in_cache($c, $options, $entity, $code)
+		if !$from_cache && $c->stash->{$STASH_CHECKED};
 
-	my $method = $c->req->method;
-	my $conditional = ($method eq 'GET') || ($method eq 'HEAD');
+	return $self if $self->_answer_not_modified($c, $options, $entity, $encoded && $encoded->{encoding}, $code);
 
-	if ($conditional && ($code == 200)) {
-		my $last_modified = _resolve_last_modified($options->{last_modified}, $c, $state);
-		if (defined($last_modified) && !$headers->last_modified) {
-			$headers->last_modified(Mojo::Date->new($last_modified)->to_string);
-		}
+	# Both branches are bytes, so length() is the Content-Length
+	my $final = $encoded ? $encoded->{body} : $entity;
+	$res->body($final);
+	$res->headers->content_length(length($final));
 
-		my $etag;
-		if ($options->{generate_etag}) {
-			$etag = $headers->etag;
-			if (!defined($etag) || !length($etag)) {
-				$etag = '"' . md5_sum($entity . (defined($encoding) ? "\x00$encoding" : '')) . '"';
-				$headers->etag($etag);
-			}
-		}
-
-		if ($options->{generate_304}) {
-			my $if_none_match = $c->req->headers->if_none_match;
-			my $not_modified;
-
-			if (defined($if_none_match)) {
-				# If-None-Match takes precedence; If-Modified-Since is ignored
-				# even when there is no ETag to compare it with
-				$not_modified = defined($etag) ? _etag_matches($if_none_match, $etag) : 0;
-			} elsif ((!defined($etag) || $options->{trust_last_modified}) &&
-			  defined($last_modified) &&
-			  defined(my $since = $c->req->headers->if_modified_since)) {
-				# Without an entity tag, If-Modified-Since is the only validator
-				# the client can offer.  Last-Modified comes from the application
-				# and its templates, not from the data a page was rendered from,
-				# so on its own it cannot show that the representation is
-				# unchanged: a database row or a stash value can move under a
-				# template that has not been touched.  L</trust_last_modified>
-				# is the opt-in for pages where that cannot happen
-				my $since_epoch = eval { Mojo::Date->new($since)->epoch };
-				$not_modified = 1 if defined($since_epoch) && ($last_modified <= $since_epoch);
-			}
-
-			if ($not_modified) {
-				$c->app->log->debug('Buffer: not modified, sending 304'
-					. (defined($etag) ? " (ETag $etag)" : ''));
-				$res->code(304);
-				$res->body('');
-				$headers->remove('Content-Length');
-				return;
-			}
-		}
-	}
-
-	$res->body($body);
-	$headers->content_length(utf8::is_utf8($body) ? length(Encode::encode('UTF-8', $body)) : length($body));
-
-	return;
+	return $self;
 }
 
-# Called by the buffer_is_cached helper.  On a hit the cached response is
-# replayed and finished here, so the action only has to return.
-sub _is_cached {
-	my ($self, $c, $state) = @_;
+# Purpose:        Decide whether a response is one the plugin may rework,
+#                 and fetch its body if so.
+# Entry criteria: $res is a Mojo::Message::Response.
+# Exit status:    The body, or undef for interim and bodyless statuses,
+#                 bodies already encoded (e.g. by the renderer), multipart
+#                 and streamed content, files on disk and empty bodies.
+# Side effects:   None.
+sub _buffered_body :Private {
+	my $res = shift;
 
-	my ($options, $disabled) = _options_for($c, $state);
-	return 0 if $disabled;
+	my $code = $res->code || 0;
+	my $content = $res->content;
 
-	# Calling the helper more than once should not replay a response twice
-	# or register the same request as a waiter again
-	return 1 if $c->stash->{'buffer.from_cache'} || $c->stash->{'buffer.cache_waiter'};
-	return 0 if $c->stash->{'buffer.flight'};
+	# Short-circuit order matters: a multipart body has no asset()
+	my $ours = !($code && (($code < $HTTP_MIN_FINAL) || $BODYLESS_STATUS{$code}))
+		&& !$res->headers->content_encoding
+		&& !$content->is_multipart
+		&& !$content->is_dynamic
+		&& !$content->asset->is_file;
 
-	my $cache = $options->{cache};
-	return 0 unless $cache;
-	return 0 unless _request_cacheable($c);
+	my $body = $ours ? $content->asset->slurp : undef;
+	return (defined($body) && length($body)) ? $body : undef;
+}
 
-	# From now on a miss should populate the cache at the end of the response
-	$c->stash->{'buffer.cache_checked'} = 1;
+# Purpose:        Apply optimise_content to HTML responses.
+# Entry criteria: $type is the lower-cased media type.
+# Exit status:    The optimised body if it is smaller, else the original.
+# Side effects:   Logs the saving at debug level.
+sub _optimise_html :Private {
+	my ($self, $c, $options, $type, $body) = @_;
 
-	my $key = _cache_key($c, $options);
-	$c->stash->{'buffer.cache_key'} = $key;
+	my $optimised = ($options->{optimise_content} && $HTML_TYPES{$type})
+		? $self->_optimise($body, $c, $options)
+		: undef;
 
-	my ($entry, $error) = _lookup_entry($c, $cache, $key, $state, 1);
-	return 0 if $error;
-	return _cache_miss($c, $state, $options, $key, $cache) unless $entry;
+	# Keep the optimised body only if it really is smaller
+	if (defined($optimised) && (length($optimised) < length($body))) {
+		$self->_log($c->app, debug => 'log_optimised',
+			{from => length($body), to => length($optimised), count => length($optimised)});
+		$body = $optimised;
+	}
 
-	$c->app->log->debug("Buffer: cache hit for $key");
-	_replay_entry($c, $entry);
+	return $body;
+}
+
+# Purpose:        Compress the entity with the best coding the client
+#                 accepts.
+# Entry criteria: $entity is bytes of a compressible type.
+# Exit status:    {encoding, body} when compression was used, else undef.
+# Side effects:   Adds Vary: Accept-Encoding whenever compression is on, as
+#                 the choice of representation depends on it even when
+#                 identity wins; sets Content-Encoding when used; logs.
+sub _compress :Private {
+	my ($self, $c, $options, $entity) = @_;
+
+	return undef unless $options->{compress_content};
+
+	my $headers = $c->res->headers;
+	_add_vary($headers);
+
+	my $wanted = _negotiate_encoding($c->req->headers->accept_encoding, $options->{encodings});
+	return undef unless defined($wanted) && (length($entity) >= ($options->{min_compress_size} // 0));
+
+	my $result = _encode_body($wanted, $entity);
+	if (defined($result->{error})) {
+		$self->_log($c->app, error => 'log_compress_failed', {encoding => $wanted, error => $result->{error}});
+		return undef;
+	}
+
+	# Compression that does not save anything is not worth the header
+	return undef unless defined($result->{body}) && (length($result->{body}) < length($entity));
+
+	$headers->content_encoding($wanted);
+	$self->_log($c->app, debug => 'log_compressed',
+		{encoding => $wanted, from => length($entity), to => length($result->{body}), count => length($result->{body})});
+
+	return {encoding => $wanted, body => $result->{body}};
+}
+
+# Purpose:        Add the validators and, when they match the request,
+#                 turn the response into 304 Not Modified.
+# Entry criteria: $entity is the unencoded body; $encoding is the coding
+#                 used or undef.
+# Exit status:    1 if a 304 was produced, 0 otherwise.
+# Side effects:   Sets Last-Modified and ETag on 200 GET/HEAD responses;
+#                 on a match empties the body and changes the status.
+sub _answer_not_modified :Private {
+	my ($self, $c, $options, $entity, $encoding, $code) = @_;
+
+	return 0 unless ($code == $HTTP_OK) && $SAFE_METHODS{$c->req->method};
+
+	my $headers = $c->res->headers;
+	my $last_modified = $self->_resolve_last_modified($options->{last_modified}, $c);
+	$headers->last_modified(Mojo::Date->new($last_modified)->to_string)
+		if defined($last_modified) && !$headers->last_modified;
+
+	my $etag = $options->{generate_etag} ? _ensure_etag($headers, $entity, $encoding) : undef;
+	return 0 unless $options->{generate_304} && _is_fresh($c->req->headers, $options, $etag, $last_modified);
+
+	$self->_log($c->app, debug => defined($etag) ? 'log_not_modified_etag' : 'log_not_modified', {etag => $etag});
+	$c->res->code($HTTP_NOT_MODIFIED);
+	$c->res->body('');
+	$headers->remove('Content-Length');
 
 	return 1;
 }
 
-# Fetch and validate an entry.  Returns (entry, error); the error flag lets
-# the initial lookup distinguish a broken cache from a miss, while waiters
-# treating either as "not there yet" can ignore it.
-sub _lookup_entry {
-	my ($c, $cache, $key, $state, $log_errors) = @_;
+# Purpose:        Make sure the response has an entity tag.
+# Entry criteria: $entity is bytes; $encoding is a coding name or undef.
+# Exit status:    The tag in force: the action's own, or a new MD5 tag.
+# Side effects:   Sets the ETag header when the action did not.
+sub _ensure_etag :Private {
+	my ($headers, $entity, $encoding) = @_;
+
+	my $etag = $headers->etag;
+	if (!defined($etag) || !length($etag)) {
+		# The coding is part of the tag: gzip and identity differ
+		$etag = '"' . md5_sum($entity . (defined($encoding) ? "\x00$encoding" : '')) . '"';
+		$headers->etag($etag);
+	}
+
+	return $etag;
+}
+
+# Purpose:        Decide whether the client's copy is current (RFC 7232).
+# Entry criteria: $req_headers are the request headers; $etag and
+#                 $last_modified are what this response carries, or undef.
+# Exit status:    1 if a 304 should be sent, 0 otherwise.
+# Side effects:   None.
+sub _is_fresh :Private {
+	my ($req_headers, $options, $etag, $last_modified) = @_;
+
+	my $if_none_match = $req_headers->if_none_match;
+	my $fresh;
+
+	if (defined($if_none_match)) {
+		# If-None-Match takes precedence; If-Modified-Since is then ignored
+		# even when there is no ETag to compare it with
+		$fresh = defined($etag) && _etag_matches($if_none_match, $etag);
+	} else {
+		# Without an entity tag, If-Modified-Since is the only validator the
+		# client can offer.  Last-Modified comes from the application and its
+		# templates, not from the data a page was rendered from, so on its own
+		# it cannot show that the representation is unchanged: a database row
+		# or a stash value can move under a template that has not been
+		# touched.  trust_last_modified is the opt-in for pages where that
+		# cannot happen.
+		my $trusted = !defined($etag) || $options->{trust_last_modified};
+		my $since = $req_headers->if_modified_since;
+		my $since_epoch = ($trusted && defined($last_modified) && defined($since))
+			? eval { Mojo::Date->new($since)->epoch }
+			: undef;
+		$fresh = defined($since_epoch) && ($last_modified <= $since_epoch);
+	}
+
+	return $fresh ? 1 : 0;
+}
+
+# ---------------------------------------------------------------------------
+# The server-side cache and single-flight
+# ---------------------------------------------------------------------------
+
+# Purpose:        The buffer_is_cached helper; see its POD.
+# Entry criteria: $c is the controller the helper was called on.
+# Exit status:    1 when the plugin answers the request, 0 when the action
+#                 must run.
+# Side effects:   See the POD.  Protected so a subclass can wrap it.
+sub _is_cached :Protected {
+	my ($self, $c) = @_;
+
+	my $options = $self->_options_for($c) or return 0;
+	my $stash = $c->stash;
+
+	# Calling the helper more than once should not replay a response twice
+	# or register the same request as a waiter again
+	return 1 if $stash->{$STASH_FROM_CACHE} || $stash->{$STASH_WAITER};
+	return 0 if $stash->{$STASH_FLIGHT};
+
+	my $cache = $options->{cache};
+	return 0 unless $cache && _request_cacheable($c);
+
+	# From now on a miss should populate the cache at the end of the response
+	$stash->{$STASH_CHECKED} = 1;
+	my $key = $stash->{$STASH_KEY} = _cache_key($c, $options);
+
+	my $lookup = $self->_lookup_entry($c, $cache, $key, 1);
+	return 0 if $lookup->{failed};
+	return $self->_cache_miss($c, $options, $key, $cache) unless $lookup->{entry};
+
+	$self->_log($c->app, debug => 'log_cache_hit', {key => $key});
+	return _replay_entry($c, $lookup->{entry});
+}
+
+# Purpose:        Fetch and validate an entry.
+# Entry criteria: $cache understands get() and remove().
+# Exit status:    {entry => $entry} for a fresh entry, {} for a miss, and
+#                 {failed => 1} when the cache died, so the first lookup
+#                 can tell a broken cache from a miss while pollers treat
+#                 both as "not there yet".
+# Side effects:   Removes an entry older than the application; logs.
+sub _lookup_entry :Private {
+	my ($self, $c, $cache, $key, $log_errors) = @_;
 
 	my $entry = eval { $cache->get($key) };
 	if (my $error = $@) {
-		$c->app->log->error("Buffer: cache get failed: $error") if $log_errors;
-		return (undef, 1);
+		$self->_log($c->app, error => 'log_cache_get_failed', {error => $error}) if $log_errors;
+		return {failed => 1};
 	}
 
-	return (undef, 0) unless ref($entry) eq 'HASH' && defined($entry->{body});
+	return {} unless (ref($entry) eq 'HASH') && defined($entry->{body});
 
 	# An entry created before the application was last changed may have been
 	# produced by different code, so throw it away
-	my $mtime = _application_mtime($c, $state);
+	my $mtime = $self->_application_mtime($c);
 	if (defined($mtime) && (($entry->{created} // 0) < $mtime)) {
-		$c->app->log->debug('Buffer: discarding a cache entry older than the application or its templates');
+		$self->_log($c->app, debug => 'log_stale_entry');
 		eval { $cache->remove($key) };
-		return (undef, 0);
+		return {};
 	}
 
-	return ($entry, 0);
+	return {entry => $entry};
 }
 
-# A miss either joins an in-flight build for the same key or becomes the
-# request that will build and store it.
-sub _cache_miss {
-	my ($c, $state, $options, $key, $cache) = @_;
+# Purpose:        Handle a miss: join an in-flight build of the same key,
+#                 or become the request that builds and stores it.
+# Entry criteria: The cache has no fresh entry for $key.
+# Exit status:    1 if this request now waits, 0 if the action must run.
+# Side effects:   Sets X-Cache: MISS; may take the shared lock; may start
+#                 a flight or register a waiter.
+sub _cache_miss :Private {
+	my ($self, $c, $options, $key, $cache) = @_;
 
-	$c->res->headers->header('X-Cache' => 'MISS');
+	$c->res->headers->header($X_CACHE => $MISS);
 	return 0 unless $options->{cache_single_flight};
 
 	# Include the cache object so that two caches with the same key do not
 	# wait for each other
 	my $id = refaddr($cache) . "\x00$key";
-	if (my $flight = $state->{inflight}{$id}) {
-		return _join_flight($c, $state, $flight);
-	}
+	my $flight = $self->{inflight}{$id};
+	return $self->_join_flight($c, $flight) if $flight;
 
 	# With a lock backend, elect one worker to build the entry and make the
-	# others wait for it, even though they cannot share the flight table above.
-	my $lock;
-	if ($state->{lock}) {
-		my $error;
-		($lock, $error) = _acquire_lock($state->{lock}, $key);
-		if (!$lock) {
-			if (defined($error)) {
-				$c->app->log->error("Buffer: shared cache lock failed: $error");
-			} else {
-				return _join_shared_lock($c, $state, $options, $key, $cache);
-			}
-		}
+	# others wait for it, even though they cannot share the flight table
+	my $guard;
+	if ($self->{lock}) {
+		my $lock = $self->_acquire_lock($key);
+		return $self->_join_shared_lock($c, $options, $key, $cache) if $lock->{busy};
+
+		# On a backend error, carry on with a flight local to this worker
+		$self->_log($c->app, error => 'log_lock_failed', {error => $lock->{error}}) if !$lock->{guard};
+		$guard = $lock->{guard};
 	}
 
-	_start_flight($c, $state, $id, $key, $options, $lock);
+	$self->_start_flight($c, $id, $key, $options, $guard);
 
 	return 0;
 }
 
-sub _start_flight {
-	my ($c, $state, $id, $key, $options, $lock) = @_;
+# Purpose:        Register this request as the builder for a key.
+# Entry criteria: No flight exists for $id.
+# Exit status:    $self.
+# Side effects:   Adds the flight, stores it in the stash, and arms a timer
+#                 that releases it if the action never finishes.
+sub _start_flight :Private {
+	my ($self, $c, $id, $key, $options, $guard) = @_;
 
 	my $timeout = _lock_timeout($options);
 	my $flight = {
@@ -1067,166 +1742,168 @@ sub _start_flight {
 		key => $key,
 		deadline => Time::HiRes::time() + $timeout,
 		waiters => {},
-		lock => $lock,
+		lock => $guard,
 	};
 
-	# Do not keep the key reserved for ever if the action never finishes
-	$flight->{timer} = Mojo::IOLoop->timer($timeout => sub {
-		_expire_flight($c->app, $state, $flight);
-	});
+	# Do not keep the key reserved for ever if the action never finishes.
+	# Capture the app, not $c, so the timer does not keep the controller.
+	my $app = $c->app;
+	$flight->{timer} = Mojo::IOLoop->timer($timeout => sub { $self->_expire_flight($app, $flight) });
 
-	$state->{inflight}{$id} = $flight;
-	$c->stash->{'buffer.flight'} = $flight;
-	$c->app->log->debug("Buffer: this request will build the cache entry for $key");
+	$self->{inflight}{$id} = $flight;
+	$c->stash->{$STASH_FLIGHT} = $flight;
+	$self->_log($app, debug => 'log_building', {key => $key});
 
-	return;
+	return $self;
 }
 
-# Hold a second request for the same key until the first one has finished.
-# The response has to be finished later, so suppress automatic rendering.
-sub _join_flight {
-	my ($c, $state, $flight) = @_;
+# Purpose:        Hold a second request for the same key until the first
+#                 one has finished.
+# Entry criteria: $flight is the in-flight build this request joins.
+# Exit status:    1 (the plugin will answer this request).
+# Side effects:   Suppresses automatic rendering; arms a give-up timer.
+sub _join_flight :Private {
+	my ($self, $c, $flight) = @_;
 
 	my $id = refaddr($c);
-	return 1 if $flight->{waiters}{$id};
-	return 1 if $c->stash->{'mojo.finished'};
+	return 1 if $flight->{waiters}{$id} || $c->stash->{$STASH_FINISHED};
 
-	$c->stash->{'buffer.cache_waiter'} = 1;
+	# The response has to be finished later, so suppress automatic rendering
+	$c->stash->{$STASH_WAITER} = 1;
 	$c->render_later;
 
+	# Every waiter gets at least one tick, even past the deadline
 	my $remaining = $flight->{deadline} - Time::HiRes::time();
-	$remaining = 0.05 if $remaining < 0.05;
+	$remaining = $MIN_WAITER_DELAY if $remaining < $MIN_WAITER_DELAY;
+
 	$flight->{waiters}{$id} = {
 		c => $c,
-		timer => Mojo::IOLoop->timer($remaining => sub {
-			_expire_waiter($c->app, $state, $flight, $id);
-		}),
+		timer => Mojo::IOLoop->timer($remaining => sub { $self->_expire_waiter($flight, $id) }),
 	};
-
-	$c->app->log->debug("Buffer: waiting for the cache entry for $flight->{key}");
+	$self->_log($c->app, debug => 'log_waiting', {key => $flight->{key}});
 
 	return 1;
 }
 
-sub _expire_waiter {
-	my ($app, $state, $flight, $id) = @_;
+# Purpose:        Give up on one waiter whose deadline passed.
+# Entry criteria: Called from the waiter's timer.
+# Exit status:    $self.
+# Side effects:   Removes the waiter and answers it with a 503.
+sub _expire_waiter :Private {
+	my ($self, $flight, $id) = @_;
 
-	my $waiter = delete $flight->{waiters}{$id} or return;
-	my $c = $waiter->{c};
-	return if !$c || $c->stash->{'mojo.finished'};
+	my $waiter = delete($flight->{waiters}{$id});
+	my $c = $waiter ? $waiter->{c} : undef;
+	if ($c && !$c->stash->{$STASH_FINISHED}) {
+		$self->_log($c->app, debug => 'log_gave_up');
+		$self->_service_unavailable($c);
+	}
 
-	$app->log->debug('Buffer: gave up waiting for another request to finish');
-	_service_unavailable($c);
-
-	return;
+	return $self;
 }
 
-# A request in another worker holds the shared lock.  The builder cannot
-# notify us, so poll the cache until the entry appears or the lock is gone.
-sub _join_shared_lock {
-	my ($c, $state, $options, $key, $cache) = @_;
+# Purpose:        Wait for a request in another worker that holds the
+#                 shared lock.  The builder cannot notify us, so poll the
+#                 cache until the entry appears or the lock is gone.
+# Entry criteria: The lock backend reported the key as held elsewhere.
+# Exit status:    1 (the plugin will answer this request).
+# Side effects:   Suppresses automatic rendering; installs a recurring
+#                 timer that ends itself.
+sub _join_shared_lock :Private {
+	my ($self, $c, $options, $key, $cache) = @_;
 
-	$c->stash->{'buffer.cache_waiter'} = 1;
+	$c->stash->{$STASH_WAITER} = 1;
 	$c->render_later;
 
 	my $deadline = Time::HiRes::time() + _lock_timeout($options);
-	$c->app->log->debug("Buffer: waiting for another worker to build the cache entry for $key");
+	$self->_log($c->app, debug => 'log_waiting_worker', {key => $key});
 
 	my ($poll, $done);
-	$poll = Mojo::IOLoop->recurring(0.1 => sub {
+	$poll = Mojo::IOLoop->recurring($SHARED_POLL_INTERVAL => sub {
 		return if $done;
 
-		if ($c->stash->{'mojo.finished'}) {
-			$done = 1;
-			Mojo::IOLoop->remove($poll);
-			return;
-		}
-
-		my ($entry) = _lookup_entry($c, $cache, $key, $state, 0);
-		if ($entry) {
-			$done = 1;
-			Mojo::IOLoop->remove($poll);
-			$c->app->log->debug('Buffer: another worker filled the cache entry');
-			_finish_waiting_request($c, $entry);
-			return;
-		}
-
-		if (Time::HiRes::time() >= $deadline) {
-			$done = 1;
-			Mojo::IOLoop->remove($poll);
-			$c->app->log->debug('Buffer: gave up waiting for another worker');
-			_finish_waiting_request($c, undef);
-			return;
-		}
-
-		# If the lock can be taken, the builder has finished.  Hold it while
-		# checking again so that a new builder cannot start in between.
-		my ($lock, $error) = _acquire_lock($state->{lock}, $key);
-		if (!$lock) {
-			return unless defined($error);
-			$done = 1;
-			Mojo::IOLoop->remove($poll);
-			$c->app->log->error("Buffer: shared cache lock failed: $error");
-			_finish_waiting_request($c, undef);
-			return;
-		}
-
-		my ($late) = _lookup_entry($c, $cache, $key, $state, 0);
-		my ($released, $release_error) = _release_lock($state->{lock}, $lock);
-		$c->app->log->error("Buffer: shared cache unlock failed: $release_error") unless $released;
+		# undef means "keep waiting"; anything else ends the poll
+		my $outcome = $self->_poll_shared_lock($c, $key, $cache, $deadline) or return;
 		$done = 1;
 		Mojo::IOLoop->remove($poll);
-
-		if ($late) {
-			$c->app->log->debug('Buffer: another worker filled the cache entry');
-		} else {
-			$c->app->log->debug('Buffer: the other worker did not cache a response');
-		}
-		_finish_waiting_request($c, $late);
+		$self->_answer_waiter($c->app, $c, $outcome->{entry}) unless $outcome->{abandoned};
 	});
 
 	return 1;
 }
 
-sub _finish_waiting_request {
-	my ($c, $entry) = @_;
+# Purpose:        One poll of a cross-worker wait.
+# Entry criteria: Called from _join_shared_lock's timer.
+# Exit status:    undef to keep polling; {abandoned => 1} if the request
+#                 was finished elsewhere; otherwise {entry => $entry},
+#                 where a missing entry means "answer with a 503".
+# Side effects:   May take and release the shared lock; logs.
+sub _poll_shared_lock :Private {
+	my ($self, $c, $key, $cache, $deadline) = @_;
 
-	my $ok = eval {
-		if ($entry) {
-			_replay_entry($c, $entry);
-		} else {
-			_service_unavailable($c);
-		}
-		1;
-	};
-	$c->app->log->error("Buffer: could not finish a waiting request: $@") unless $ok;
+	my $app = $c->app;
+	return {abandoned => 1} if $c->stash->{$STASH_FINISHED};
 
-	return;
+	my $entry = $self->_lookup_entry($c, $cache, $key, 0)->{entry};
+	if ($entry) {
+		$self->_log($app, debug => 'log_filled_elsewhere');
+		return {entry => $entry};
+	}
+
+	if (Time::HiRes::time() >= $deadline) {
+		$self->_log($app, debug => 'log_gave_up_worker');
+		return {};
+	}
+
+	# If the lock can be taken, the builder has finished.  Hold it while
+	# checking again so that a new builder cannot start in between.
+	my $lock = $self->_acquire_lock($key);
+	return undef if $lock->{busy};
+	if (!$lock->{guard}) {
+		$self->_log($app, error => 'log_lock_failed', {error => $lock->{error}});
+		return {};
+	}
+
+	my $late = $self->_lookup_entry($c, $cache, $key, 0)->{entry};
+	$self->_release_lock_logged($app, $lock->{guard});
+	$self->_log($app, debug => $late ? 'log_filled_elsewhere' : 'log_not_cached_elsewhere');
+
+	return {entry => $late};
 }
 
-sub _expire_flight {
-	my ($app, $state, $flight) = @_;
+# Purpose:        Release a flight whose builder did not finish in time.
+# Entry criteria: Called from the flight's timer.
+# Exit status:    $self.
+# Side effects:   Logs, then answers the waiters with a 503 and releases
+#                 the shared lock.
+sub _expire_flight :Private {
+	my ($self, $app, $flight) = @_;
 
-	my $current = $state->{inflight}{$flight->{id}};
-	return unless $current && refaddr($current) == refaddr($flight);
+	if ($self->_is_current_flight($flight)) {
+		$self->_log($app, debug => 'log_flight_expired');
+		$self->_release_flight($app, $flight, undef);
+	}
 
-	$app->log->debug('Buffer: an in-flight response did not finish in time');
-	_release_flight($app, $state, $flight, undef);
-
-	return;
+	return $self;
 }
 
-# Finish every request waiting for this key.  With a stored entry they are
-# served it; without one (a failed or uncacheable response) they are told to
-# retry rather than each running the action, which is what single-flight is
-# meant to prevent.
-sub _release_flight {
-	my ($app, $state, $flight, $entry) = @_;
+# Purpose:        Finish every request waiting for this key.  With a stored
+#                 entry they are served it; without one (a failed or
+#                 uncacheable response) they are told to retry rather than
+#                 each running the action, which is what single-flight is
+#                 meant to prevent.
+# Entry criteria: $flight was started by _start_flight.
+# Exit status:    $self.
+# Side effects:   Removes the flight and its timers; answers waiters;
+#                 releases the shared lock.
+sub _release_flight :Private {
+	my ($self, $app, $flight, $entry) = @_;
 
-	my $current = $state->{inflight}{$flight->{id}};
-	return unless $current && refaddr($current) == refaddr($flight);
+	# A flight is only released once, by whichever of the finished response
+	# and the timeout comes first
+	return $self unless $self->_is_current_flight($flight);
 
-	delete $state->{inflight}{$flight->{id}};
+	delete($self->{inflight}{$flight->{id}});
 	Mojo::IOLoop->remove($flight->{timer}) if defined($flight->{timer});
 
 	my @waiters = values %{$flight->{waiters}};
@@ -1234,44 +1911,71 @@ sub _release_flight {
 
 	for my $waiter (@waiters) {
 		Mojo::IOLoop->remove($waiter->{timer}) if defined($waiter->{timer});
-		my $c = $waiter->{c};
-		next if !$c || $c->stash->{'mojo.finished'};
-
-		my $ok = eval {
-			if ($entry) {
-				$app->log->debug('Buffer: serving a waiting request from the finished response');
-				_replay_entry($c, $entry);
-			} else {
-				$app->log->debug('Buffer: the in-flight response could not be cached');
-				_service_unavailable($c);
-			}
-			1;
-		};
-		$app->log->error("Buffer: could not finish a waiting request: $@") unless $ok;
+		$self->_answer_waiter($app, $waiter->{c}, $entry,
+			$entry ? 'log_serving_waiter' : 'log_uncacheable_flight');
 	}
 
-	if (my $lock = delete $flight->{lock}) {
-		my ($released, $error) = _release_lock($state->{lock}, $lock);
-		$app->log->error("Buffer: shared cache unlock failed: $error") unless $released;
-	}
+	my $guard = delete($flight->{lock});
+	$self->_release_lock_logged($app, $guard) if $guard;
 
-	return;
+	return $self;
 }
 
-sub _replay_entry {
+# Purpose:        Check that a flight is still the one registered for its
+#                 key, rather than one released earlier.
+# Entry criteria: $flight is a flight hash.
+# Exit status:    1 or 0.
+# Side effects:   None.
+sub _is_current_flight :Private {
+	my ($self, $flight) = @_;
+
+	my $current = $self->{inflight}{$flight->{id}};
+	return ($current && (refaddr($current) == refaddr($flight))) ? 1 : 0;
+}
+
+# Purpose:        Finish a request that was waiting for another one.
+# Entry criteria: $entry is the stored entry, or undef for "retry later";
+#                 $note is an optional log key.
+# Exit status:    $self.
+# Side effects:   Replays the entry or sends a 503; logs failures.  Skips
+#                 requests that are already finished.
+sub _answer_waiter :Private {
+	my ($self, $app, $c, $entry, $note) = @_;
+
+	# A client that went away, or was answered by a timeout, needs nothing
+	if ($c && !$c->stash->{$STASH_FINISHED}) {
+		$self->_log($app, debug => $note) if $note;
+		my $ok = eval { $entry ? _replay_entry($c, $entry) : $self->_service_unavailable($c); 1 };
+		$self->_log($app, error => 'log_finish_waiter_failed', {error => $@}) unless $ok;
+	}
+
+	return $self;
+}
+
+# Purpose:        Send a cached entry as this request's response.
+# Entry criteria: $entry has body, and optionally status and headers.
+# Exit status:    1.
+# Side effects:   Replaces status, stored headers and body; adds
+#                 X-Cache: HIT; finishes the response.
+sub _replay_entry :Private {
 	my ($c, $entry) = @_;
 
-	$c->res->code($entry->{status} || 200);
-	my $headers = $c->res->headers;
+	my $res = $c->res;
+	my $headers = $res->headers;
+	$res->code($entry->{status} || $HTTP_OK);
+
+	# The first stored value replaces whatever the action set; later values
+	# of the same header are added, so multi-valued headers survive
 	my %seen;
 	for my $pair (@{$entry->{headers} || []}) {
 		my ($name, $value) = @$pair;
 		$headers->remove($name) unless $seen{lc($name)}++;
 		$headers->add($name => $value);
 	}
-	$c->res->body($entry->{body});
-	$headers->header('X-Cache' => 'HIT');
-	$c->stash->{'buffer.from_cache'} = 1;
+
+	$res->body($entry->{body});
+	$headers->header($X_CACHE => $HIT);
+	$c->stash->{$STASH_FROM_CACHE} = 1;
 
 	# Finish the response; the action can just return now
 	$c->rendered;
@@ -1279,272 +1983,405 @@ sub _replay_entry {
 	return 1;
 }
 
-sub _service_unavailable {
-	my $c = shift;
+# Purpose:        Tell a waiting client to retry shortly.
+# Entry criteria: $c has not been finished.
+# Exit status:    1.
+# Side effects:   Sends 503 with Retry-After and the retry_later text,
+#                 encoded as UTF-8 so a translated message is safe.
+sub _service_unavailable :Private {
+	my ($self, $c) = @_;
 
-	my $headers = $c->res->headers;
-	$c->res->code(503);
+	my $res = $c->res;
+	my $headers = $res->headers;
+	$res->code($HTTP_UNAVAILABLE);
 	$headers->content_type('text/plain; charset=UTF-8');
 	$headers->header('Cache-Control' => 'no-store');
-	$headers->header('Retry-After' => 1);
-	$headers->header('X-Cache' => 'MISS');
-	$c->res->body("The page is being generated, please try again.\n");
+	$headers->header('Retry-After' => $RETRY_AFTER);
+	$headers->header($X_CACHE => $MISS);
+	$res->body(encode('UTF-8', $self->i18n('retry_later')));
 	$c->rendered;
 
 	return 1;
 }
 
-sub _lock_timeout {
+# Purpose:        The effective wait limit for this response.
+# Entry criteria: $options may hold an unvalidated stash override.
+# Exit status:    A positive number of seconds; the default when the
+#                 value is missing or unusable.
+# Side effects:   None.
+sub _lock_timeout :Private {
 	my $options = shift;
 
 	my $timeout = $options->{cache_lock_timeout};
-	return 10 unless defined($timeout) && !ref($timeout) && $timeout =~ /^\d+(?:\.\d+)?$/ && $timeout > 0;
-
-	return $timeout + 0;
+	return (defined($timeout) && _option_valid('cache_lock_timeout', $timeout)) ? $timeout + 0 : $DEFAULT_LOCK_TIMEOUT;
 }
 
-# Call a pluggable lock backend.  A backend may die, so exceptions are
-# converted into errors and the caller can fall back to a per-worker flight
-# rather than breaking the request.
-sub _acquire_lock {
-	my ($backend, $key) = @_;
+# Purpose:        Call the lock backend's acquire().  A backend may die, so
+#                 exceptions become errors and the caller can fall back to
+#                 a per-worker flight rather than breaking the request.
+# Entry criteria: $self->{lock} is set.
+# Exit status:    {guard, error, busy}: busy is true when another process
+#                 holds the lock and nothing went wrong.
+# Side effects:   Whatever the backend does.
+sub _acquire_lock :Private {
+	my ($self, $key) = @_;
 
 	my ($guard, $error);
-	my $ok = eval { ($guard, $error) = $backend->acquire($key); 1 };
-	if (!$ok) {
-		my $exception = $@;
-		chomp($exception);
-		return (undef, $exception);
-	}
+	my $ok = eval { ($guard, $error) = $self->{lock}->acquire($key); 1 };
+	$error = trim("$@") unless $ok;
+	$guard = undef unless $ok && $guard;
 
-	return $guard ? ($guard, $error) : (undef, $error);
+	return {guard => $guard, error => $error, busy => (!$guard && !defined($error)) ? 1 : 0};
 }
 
-sub _release_lock {
-	my ($backend, $lock) = @_;
+# Purpose:        Call the lock backend's release(), normalising its
+#                 answer.
+# Entry criteria: $guard came from _acquire_lock.
+# Exit status:    {ok => 1} or {ok => 0, error => $text}.  A backend that
+#                 returns nothing is treated as having released the lock.
+# Side effects:   Whatever the backend does.
+sub _release_lock :Private {
+	my ($self, $guard) = @_;
 
-	return (1, undef) unless $lock;
+	my ($released, $error);
+	my $called = eval { ($released, $error) = $self->{lock}->release($guard); 1 };
 
-	my ($ok, $error);
-	my $success = eval { ($ok, $error) = $backend->release($lock); 1 };
-	if (!$success) {
-		my $exception = $@;
-		chomp($exception);
-		return (0, $exception);
-	}
-
-	# A backend that returns nothing is treated as having released the lock
-	return (1, undef) unless defined($ok);
-	return $ok ? (1, $error) : (0, $error // 'unknown error');
+	return !$called ? {ok => 0, error => trim("$@")}
+		: (!defined($released) || $released) ? {ok => 1}
+		: {ok => 0, error => $error // $self->i18n('unknown_error')};
 }
 
-sub _store_in_cache {
-	my ($c, $options, $entity, $code) = @_;
+# Purpose:        Release a shared lock, logging a failure.
+# Entry criteria: $guard came from _acquire_lock.
+# Exit status:    $self.
+# Side effects:   Releases the lock; logs at error level on failure.
+sub _release_lock_logged :Private {
+	my ($self, $app, $guard) = @_;
+
+	my $result = $self->_release_lock($guard);
+	$self->_log($app, error => 'log_unlock_failed', {error => $result->{error}}) unless $result->{ok};
+
+	return $self;
+}
+
+# Purpose:        Store a finished response in the cache.
+# Entry criteria: $entity is the unencoded body; $code the status.
+# Exit status:    $self.
+# Side effects:   Writes the cache; sets X-Cache: MISS if unset; stores
+#                 the entry in the stash for waiting requests; logs.
+sub _store_in_cache :Private {
+	my ($self, $c, $options, $entity, $code) = @_;
 
 	my $cache = $options->{cache};
-	return unless $cache;
-	return unless $code == 200;
-	return unless _request_cacheable($c);
-	return unless _response_cacheable($c->res, $options);
+	return $self unless $cache && ($code == $HTTP_OK)
+		&& _request_cacheable($c) && _response_cacheable($c->res, $options);
 
-	my $key = $c->stash->{'buffer.cache_key'} // _cache_key($c, $options);
+	my $key = $c->stash->{$STASH_KEY} // _cache_key($c, $options);
 	my $entry = {
 		body => $entity,
-		status => 200,
+		status => $HTTP_OK,
 		created => time,
 		headers => _headers_to_store($c->res->headers),
 	};
-	my $duration = defined($options->{cache_duration}) ? $options->{cache_duration} : '10 minutes';
 
-	my $ok = eval { $cache->set($key, $entry, $duration); 1 };
-	if (!$ok) {
-		$c->app->log->error("Buffer: cache set failed: $@");
-		return;
+	my $duration = $options->{cache_duration} // $DEFAULT_CACHE_DURATION;
+	if (!eval { $cache->set($key, $entry, $duration); 1 }) {
+		$self->_log($c->app, error => 'log_cache_set_failed', {error => $@});
+		return $self;
 	}
 
-	$c->app->log->debug("Buffer: cached the response for $key");
-	$c->res->headers->header('X-Cache' => 'MISS') unless defined($c->res->headers->header('X-Cache'));
+	$self->_log($c->app, debug => 'log_cached', {key => $key});
+	my $headers = $c->res->headers;
+	$headers->header($X_CACHE => $MISS) unless defined($headers->header($X_CACHE));
 
 	# Hand this entry to any request that was waiting for it
-	$c->stash->{'buffer.stored'} = $entry;
+	$c->stash->{$STASH_STORED} = $entry;
 
-	return;
+	return $self;
 }
 
-sub _cache_key {
+# Purpose:        Compute the cache key for this request.
+# Entry criteria: $options holds cache_key and vary_by.
+# Exit status:    The custom key if one applies, else 'buffer:' and an MD5
+#                 of the app class, host, path, query and vary_by values.
+# Side effects:   Calls a cache_key coderef.
+sub _cache_key :Private {
 	my ($c, $options) = @_;
 
 	my $custom = $options->{cache_key};
 	$custom = $custom->($c) if ref($custom) eq 'CODE';
 	return $custom if defined($custom) && !ref($custom) && length($custom);
 
-	my $url = $c->req->url;
-	my $host = $url->host_port // $c->req->headers->host // '';
-	my $material = join "\x00", ref($c->app), $host, $url->path->to_string, $url->query->to_string;
-	for my $name (@{$options->{vary_by} || []}) {
-		$material .= "\x00" . lc($name) . '=' . ($c->req->headers->header($name) // '');
-	}
+	my $req = $c->req;
+	my $url = $req->url;
+	my @material = (
+		ref($c->app),
+		$url->host_port // $req->headers->host // '',
+		$url->path->to_string,
+		$url->query->to_string,
+	);
+
+	# Header names are case-insensitive, so the key uses the lower-cased name
+	push @material, map { lc($_) . '=' . ($req->headers->header($_) // '') } @{$options->{vary_by} || []};
 
 	# A digest keeps the key short, driver-safe and free of cookie data
-	return 'buffer:' . md5_sum($material);
+	return $KEY_PREFIX . md5_sum(join("\x00", @material));
 }
 
-sub _request_cacheable {
+# Purpose:        Decide whether this request may use the cache at all.
+# Entry criteria: $c is the current controller.
+# Exit status:    1 or 0.
+# Side effects:   None.
+sub _request_cacheable :Private {
 	my $c = shift;
 
-	return 0 if $ENV{NO_CACHE} || $ENV{NO_STORE};
-
-	my $method = $c->req->method;
-	return 0 unless ($method eq 'GET') || ($method eq 'HEAD');
+	my $req = $c->req;
 
 	# Authenticated responses are per-user, whatever the URL says
-	return 0 if $c->req->headers->authorization;
-
-	my $control = lc($c->req->headers->cache_control // '');
-	return 0 if $control =~ /(?:^|,)\s*(?:no-store|no-cache|private|max-age\s*=\s*0)\b/;
-
-	return 1;
+	return ($ENV{NO_CACHE} || $ENV{NO_STORE}) ? 0
+		: !$SAFE_METHODS{$req->method} ? 0
+		: $req->headers->authorization ? 0
+		: _cache_control_forbids($req->headers->cache_control, \%REQUEST_NO_CACHE) ? 0
+		: 1;
 }
 
-sub _response_cacheable {
+# Purpose:        Decide whether a finished response may be stored.
+# Entry criteria: $res is the response; $options holds vary_by.
+# Exit status:    1 or 0.
+# Side effects:   None.
+sub _response_cacheable :Private {
 	my ($res, $options) = @_;
 
 	my $headers = $res->headers;
 
-	# Never replay cookies that were meant for one client
-	return 0 if $headers->set_cookie;
+	# The request headers the key covers, plus the coding we vary on anyway
+	my %allowed = map { lc($_) => 1 } @{$options->{vary_by} || []}, 'accept-encoding';
+	my @varies = grep { length } map { lc(trim($_)) } split(/,/, $headers->vary // '');
 
-	my $control = lc($headers->cache_control // '');
-	return 0 if $control =~ /(?:^|,)\s*(?:no-store|private)\b/;
+	# Never replay cookies that were meant for one client, nor a response
+	# that varies on something the key does not cover: it would be served to
+	# the wrong client
+	my $cacheable = !$headers->set_cookie
+		&& !_cache_control_forbids($headers->cache_control, \%RESPONSE_NO_STORE)
+		&& !grep { !$allowed{$_} } @varies;
 
-	# A response that varies on something that is not part of the key would
-	# be served to the wrong client
-	my %allowed = map { lc($_) => 1 } @{$options->{vary_by} || []};
-	$allowed{'accept-encoding'} = 1;
-	for my $name (split /,/, ($headers->vary // '')) {
-		$name =~ s/^\s+//;
-		$name =~ s/\s+$//;
-		next unless length($name);
-		return 0 unless $allowed{lc($name)};
-	}
-
-	return 1;
+	return $cacheable ? 1 : 0;
 }
 
-sub _headers_to_store {
+# Purpose:        Check a Cache-Control value for forbidding directives.
+# Entry criteria: $value is the header or undef; $directives is a set of
+#                 lower-case directive names.
+# Exit status:    1 if a listed directive is present (max-age only when
+#                 it is zero), else 0.
+# Side effects:   None.  Mojo::Util::split_header does the parsing, so
+#                 quoted values and "no-cache-foo" are handled correctly.
+sub _cache_control_forbids :Private {
+	my ($value, $directives) = @_;
+
+	my $forbidden = 0;
+	for my $directive (@{split_header($value // '')}) {
+		my ($name, $argument) = (lc($directive->[0]), $directive->[1]);
+		next unless $directives->{$name};
+		$forbidden = 1 if ($name ne 'max-age') || (defined($argument) && ($argument =~ /^0+$/));
+	}
+
+	return $forbidden;
+}
+
+# Purpose:        Pick the response headers worth storing with an entry.
+# Entry criteria: $headers is a Mojo::Headers.
+# Exit status:    An array reference of [name, value] pairs.
+# Side effects:   None.
+sub _headers_to_store :Private {
 	my $headers = shift;
 
-	my %skip = map { lc($_) => 1 } qw(
-		Connection Content-Encoding Content-Length Date ETag Keep-Alive
-		Last-Modified Server Set-Cookie Transfer-Encoding X-Cache
-	);
-
 	my @pairs;
-	for my $name (@{$headers->names}) {
-		next if $skip{lc($name)};
-		push @pairs, [$name, $_] for @{$headers->every_header($name)};
+	for my $name (grep { !$UNSTORED_HEADERS{lc($_)} } @{$headers->names}) {
+		push @pairs, map { [$name, $_] } @{$headers->every_header($name)};
 	}
 
 	return \@pairs;
 }
 
-sub _script_mtime {
-	my $state = shift;
+# ---------------------------------------------------------------------------
+# Modification times
+# ---------------------------------------------------------------------------
 
-	return $state->{script_mtime} if exists($state->{script_mtime});
+# Purpose:        The application script's mtime.
+# Entry criteria: None.
+# Exit status:    An epoch, or undef if $0 is not a readable file.
+# Side effects:   Remembers the answer for the life of the plugin: the
+#                 running code does not change when the file does.
+sub _script_mtime :Private {
+	my $self = shift;
 
-	my $script = $0;
-	my @stat = (defined($script) && length($script) && -f $script) ? stat($script) : ();
-
-	return $state->{script_mtime} = @stat ? $stat[9] : undef;
-}
-
-# The newest mtime of the application and the templates.  Both Last-Modified
-# and cache invalidation use this, so a template edit invalidates a page even
-# though the application script has not changed.
-sub _application_mtime {
-	my ($c, $state) = @_;
-
-	my $key = 'buffer.application_mtime';
-	return $c->stash->{$key} if exists($c->stash->{$key});
-
-	my $cache = $state->{options}{template_mtime_cache};
-	my $cache_key;
-	if ($cache) {
-		$cache_key = _template_mtime_cache_key($c, $state);
-		my $cached = eval { $cache->get($cache_key) };
-		if (my $error = $@) {
-			$c->app->log->debug("Buffer: template mtime cache get failed: $error");
-		} elsif (defined($cached) && $cached =~ /^\d+$/) {
-			return $c->stash->{$key} = $cached;
-		}
+	if (!exists($self->{script_mtime})) {
+		my $script = $0;
+		my @stat = (defined($script) && length($script) && -f $script) ? stat($script) : ();
+		$self->{script_mtime} = @stat ? $stat[9] : undef;
 	}
 
-	my $latest = _script_mtime($state);
+	return $self->{script_mtime};
+}
+
+# Purpose:        The newest mtime of the application and the templates.
+#                 Both Last-Modified and cache invalidation use this, so a
+#                 template edit invalidates a page even though the
+#                 application script has not changed.
+# Entry criteria: $c is the current controller.
+# Exit status:    An epoch, or undef if nothing could be stat()ed.
+# Side effects:   Caches the answer in the stash for this request, and in
+#                 template_mtime_cache if configured.
+sub _application_mtime :Private {
+	my ($self, $c) = @_;
+
+	my $stash = $c->stash;
+
+	# Once per request: the cache lookup and the replay both ask
+	if (!exists($stash->{$STASH_MTIME})) {
+		my $cache = $self->{options}{template_mtime_cache};
+		my $cache_key = $cache ? $self->_template_mtime_cache_key($c) : undef;
+		my $latest = $cache ? $self->_cached_mtime($c, $cache, $cache_key) : undef;
+
+		# A miss, or no mtime cache at all, means walking the tree
+		if (!defined($latest)) {
+			$latest = $self->_scan_mtime($c);
+			$self->_remember_mtime($c, $cache, $cache_key, $latest) if $cache && defined($latest);
+		}
+		$stash->{$STASH_MTIME} = $latest;
+	}
+
+	return $stash->{$STASH_MTIME};
+}
+
+# Purpose:        Read a previously scanned mtime from the mtime cache.
+# Entry criteria: $cache understands get().
+# Exit status:    An epoch, or undef on a miss, junk, or a cache failure.
+# Side effects:   Logs a failure at debug level.
+sub _cached_mtime :Private {
+	my ($self, $c, $cache, $cache_key) = @_;
+
+	my $cached = eval { $cache->get($cache_key) };
+	$self->_log($c->app, debug => 'log_mtime_get_failed', {error => $@}) if $@;
+
+	return (defined($cached) && ($cached =~ /^\d+$/)) ? $cached : undef;
+}
+
+# Purpose:        Store a scanned mtime in the mtime cache.
+# Entry criteria: $cache understands set(); $latest is an epoch.
+# Exit status:    $self.
+# Side effects:   Writes the cache; logs failures at debug level, because
+#                 a broken mtime cache only costs a scan.
+sub _remember_mtime :Private {
+	my ($self, $c, $cache, $cache_key, $latest) = @_;
+
+	my $duration = $self->{options}{template_mtime_cache_duration} // $DEFAULT_MTIME_DURATION;
+	my $stored = eval { $cache->set($cache_key, $latest, $duration) };
+	if ($@) {
+		$self->_log($c->app, debug => 'log_mtime_set_failed', {error => $@});
+	} elsif (!$stored) {
+		$self->_log($c->app, debug => 'log_mtime_not_stored');
+	}
+
+	return $self;
+}
+
+# Purpose:        Walk the script and every renderer path for the newest
+#                 mtime.
+# Entry criteria: $c is the current controller.
+# Exit status:    An epoch, or undef.
+# Side effects:   stat()s every file and directory under the paths.
+sub _scan_mtime :Private {
+	my ($self, $c) = @_;
+
+	my $latest = $self->_script_mtime;
 	my %seen;
-	for my $dir (@{$c->app->renderer->paths || []}) {
-		next unless defined($dir) && length($dir);
+	for my $dir (grep { defined($_) && length($_) } @{$c->app->renderer->paths || []}) {
 		$latest = _latest_mtime($dir, $latest, \%seen);
 	}
 
-	if ($cache && defined($latest)) {
-		my $duration = $state->{options}{template_mtime_cache_duration};
-		$duration = 10 unless defined($duration) && !ref($duration) && length($duration);
-		my $stored = eval { $cache->set($cache_key, $latest, $duration) };
-		if (my $error = $@) {
-			$c->app->log->debug("Buffer: template mtime cache set failed: $error");
-		} elsif (!$stored) {
-			$c->app->log->debug('Buffer: template mtime cache did not store the scan');
-		}
-	}
-
-	return $c->stash->{$key} = $latest;
+	return $latest;
 }
 
-sub _template_mtime_cache_key {
-	my ($c, $state) = @_;
+# Purpose:        Key for the template mtime cache.
+# Entry criteria: $c is the current controller.
+# Exit status:    A key that changes with the app class, script, script
+#                 mtime and template paths.
+# Side effects:   None.
+sub _template_mtime_cache_key :Private {
+	my ($self, $c) = @_;
 
-	my @parts = (ref($c->app), defined($0) ? $0 : '', _script_mtime($state) // '');
-	push @parts, map { defined($_) ? $_ : '' } @{$c->app->renderer->paths || []};
+	my @parts = (ref($c->app), $0 // '', $self->_script_mtime // '', map { $_ // '' } @{$c->app->renderer->paths || []});
 
-	return 'buffer:template-mtime:' . md5_sum(join "\0", @parts);
+	return $MTIME_KEY_PREFIX . md5_sum(join("\0", @parts));
 }
 
-# Include directory mtimes as well as file mtimes: editing a file moves the
-# file's mtime, while adding, removing or renaming one moves its directory's.
-# stat() follows symlinks, and the seen set stops a symlink loop.
-sub _latest_mtime {
+# Purpose:        Newest mtime in a tree.  Directory mtimes are included as
+#                 well as file mtimes: editing a file moves the file's
+#                 mtime, while adding, removing or renaming one moves its
+#                 directory's.  stat() follows symlinks, and the seen set
+#                 (device:inode) stops a symlink loop.
+# Entry criteria: $path is a path; $latest the best so far or undef.
+# Exit status:    The newer of $latest and anything under $path.
+# Side effects:   stat()s and reads directories; unreadable ones are
+#                 skipped.
+sub _latest_mtime :Private {
 	my ($path, $latest, $seen) = @_;
 
 	my @stat = stat($path);
 	return $latest unless @stat;
 
-	if (defined($stat[9]) && (!defined($latest) || ($stat[9] > $latest))) {
-		$latest = $stat[9];
-	}
+	$latest = $stat[9] if defined($stat[9]) && (!defined($latest) || ($stat[9] > $latest));
 	return $latest unless -d _;
+	return $latest if $seen->{"$stat[0]:$stat[1]"}++;
 
-	my $id = "$stat[0]:$stat[1]";
-	return $latest if $seen->{$id}++;
-
-	opendir(my $dh, $path) or return $latest;
-	for my $entry (readdir $dh) {
-		next if ($entry eq '.') || ($entry eq '..');
+	# autodie makes an unreadable directory an exception; skipping it is the
+	# right answer for a freshness check, so catch it here
+	my $dh = eval { opendir(my $handle, $path); $handle } or return $latest;
+	for my $entry (File::Spec->no_upwards(readdir($dh))) {
 		$latest = _latest_mtime(File::Spec->catfile($path, $entry), $latest, $seen);
 	}
-	closedir($dh);
+	eval { closedir($dh) };
 
 	return $latest;
 }
 
-sub _optimise {
+# Purpose:        Resolve the last_modified option to an epoch.
+# Entry criteria: $option is 0, 1, an epoch, a date string or a coderef.
+# Exit status:    An epoch, or undef for "no header".
+# Side effects:   Calls a coderef; may scan the template tree.
+sub _resolve_last_modified :Private {
+	my ($self, $option, $c) = @_;
+
+	# A coderef is called once; it cannot return another coderef
+	my $value = (ref($option) eq 'CODE') ? $option->($c) : $option;
+
+	# 0, undef and references mean "no header"; 1 means "work it out from
+	# the application and its templates"; digits are an epoch; anything else
+	# is a date string for Mojo::Date
+	return (!$value || ref($value)) ? undef
+		: ($value eq '1') ? $self->_application_mtime($c)
+		: ($value =~ /^\d+$/) ? $value + 0
+		: scalar(eval { Mojo::Date->new($value)->epoch });
+}
+
+# ---------------------------------------------------------------------------
+# HTML optimisation
+# ---------------------------------------------------------------------------
+
+# Purpose:        Optimise an HTML body.
+# Entry criteria: $options->{optimise_content} is the level.
+# Exit status:    The optimised body; the squashed body if HTML::Packer is
+#                 missing or fails.
+# Side effects:   Logs a packer failure.  Protected so a subclass can use
+#                 another minifier.
+sub _optimise :Protected {
 	my ($self, $body, $c, $options) = @_;
 
 	my $level = $options->{optimise_content} || 0;
 	return $body unless $level;
 
 	$body = _squash($body);
-
 	if ($options->{rewrite_links}) {
 		my $rewritten = _rewrite_links($body, $c);
 		$body = $rewritten if defined($rewritten);
@@ -1554,51 +2391,78 @@ sub _optimise {
 	# minified, but the white-space squashing above is still worth keeping
 	return $body unless _module_available('HTML::Packer');
 
-	my $minified = eval {
-		require HTML::Packer;
-
-		my $packer_options = {
-			remove_comments => 1,
-			remove_newlines => 0,
-			do_stylesheet => 'minify',
-		};
-		if ($level >= 2) {
-			$packer_options->{do_javascript} = 'best';
-			$body =~ s/(<script.*?>)\s*<!--/$1/gi;
-			$body =~ s/\/\/-->\s*<\/script>/<\/script>/gi;
-			$body =~ s/(<script.*?>)\s+/$1/gi;
-		}
-
-		my $result = HTML::Packer->init->minify(\$body, $packer_options);
-
-		if ($level >= 2) {
-			# Turn document.write("a"); document.write("b") into
-			# document.write("a"+"b"), stopping once it stops shrinking
-			my $old_length = length($result);
-			while (1) {
-				$result =~ s/<script\s*?type\s*?=\s*?"text\/javascript"\s*?>(.*?)document\.write\((.+?)\);\s*?document\.write\((.+?)\)/<script type="text\/JavaScript">${1}document.write($2+$3)/igs;
-				my $new_length = length($result);
-				last if $new_length >= $old_length;
-				$old_length = $new_length;
-			}
-		}
-
-		$result;
-	};
-	if ($@) {
-		$c->app->log->error("Buffer: HTML::Packer failed: $@");
+	my $minified = eval { $self->_pack($body, $level) };
+	if (my $error = $@) {
+		$self->_log($c->app, error => 'log_packer_failed', {error => $error});
 		return $body;
 	}
 
 	return $minified;
 }
 
-# Reduce output, e.g. remove superfluous white-space.
-# This is the same set of substitutions used by CGI::Buffer and FCGI::Buffer.
-sub _squash {
+# Purpose:        Run HTML::Packer over a body.
+# Entry criteria: HTML::Packer is available; $level is 1 or 2.
+# Exit status:    The minified HTML.
+# Side effects:   Creates and keeps one HTML::Packer per plugin instance;
+#                 may die (the caller catches it).
+sub _pack :Private {
+	my ($self, $body, $level) = @_;
+
+	my $packer_options = {
+		remove_comments => 1,
+		remove_newlines => 0,
+		do_stylesheet => 'minify',
+	};
+
+	if ($level >= $OPTIMISE_AGGRESSIVE) {
+		# Strip the <!-- ... //--> hiding technique, which the JavaScript
+		# minifier would otherwise treat as code
+		$packer_options->{do_javascript} = 'best';
+		$body =~ s/(<script.*?>)\s*<!--/$1/gi;
+		$body =~ s/\/\/-->\s*<\/script>/<\/script>/gi;
+		$body =~ s/(<script.*?>)\s+/$1/gi;
+	}
+
+	# The packer holds no per-document state, so one per plugin will do
+	$self->{packer} //= HTML::Packer->init;
+	my $result = $self->{packer}->minify(\$body, $packer_options);
+
+	return ($level >= $OPTIMISE_AGGRESSIVE) ? _merge_document_writes($result) : $result;
+}
+
+# Purpose:        Turn document.write("a"); document.write("b") into
+#                 document.write("a"+"b").
+# Entry criteria: $html is minified HTML.
+# Exit status:    The rewritten HTML, stopping once it stops shrinking.
+# Side effects:   None.
+sub _merge_document_writes :Private {
+	my $html = shift;
+
+	my $old_length = length($html);
+	while (1) {
+		$html =~ s/<script\s*?type\s*?=\s*?"text\/javascript"\s*?>(.*?)document\.write\((.+?)\);\s*?document\.write\((.+?)\)/<script type="text\/JavaScript">${1}document.write($2+$3)/igs;
+		my $new_length = length($html);
+		last if $new_length >= $old_length;
+		$old_length = $new_length;
+	}
+
+	return $html;
+}
+
+# Purpose:        Reduce output by removing superfluous white space.  This
+#                 is the set of substitutions used by CGI::Buffer and
+#                 FCGI::Buffer, with two corrections: a "+" at the start of
+#                 a line is no longer deleted, and the content of pre,
+#                 textarea, script and style elements is left alone.
+# Entry criteria: $body is HTML.
+# Exit status:    The squashed HTML.
+# Side effects:   None.
+sub _squash :Private {
 	my $body = shift;
 
-	$body =~ s/(((\s+|\r)\n|\n(\s+|\+)))/\n/g;
+	my $vault = _protect_verbatim(\$body);
+
+	$body =~ s/((\s+|\r)\n|\n\s+)/\n/g;
 	$body =~ s/\<\/div\>\s+\<div/\<\/div\>\<div/gis;
 	$body =~ s/(<div>\s+|\s+<div>)/<div>/gis;
 	$body =~ s/\s+<\/div\>/\<\/div\>/gis;
@@ -1621,7 +2485,7 @@ sub _squash {
 	$body =~ s/\<br\>\s/\<br\>/gi;
 	$body =~ s/\s+\<br/\<br/gi;
 	$body =~ s/\<br\s?\/\>\s/\<br \/>/gi;
-	$body =~ s/[ \t]+/ /gs;	# Don't use \s+, it breaks JavaScript
+	$body =~ s/[ \t]+/ /gs;	# Don't use \s+, it would join lines
 	$body =~ s/\s\<p\>/\<p\>/gi;
 	$body =~ s/\s\<script/\<script/gi;
 	$body =~ s/(<script>\s|\s<script>)/<script>/gis;
@@ -1639,188 +2503,217 @@ sub _squash {
 	$body =~ s/<title>\s*(.+?)\s*<\/title>/<title>$1<\/title>/is;
 	$body =~ s/<\/center>\s+<center>/ /gis;
 
+	return _restore_verbatim($body, $vault);
+}
+
+# Purpose:        Swap the content of white-space-sensitive elements for
+#                 placeholders, so the squasher cannot change it.
+# Entry criteria: $body_ref refers to the HTML.
+# Exit status:    {marker, saved}: what _restore_verbatim needs.
+# Side effects:   Rewrites $$body_ref in place.  The tags themselves stay,
+#                 so white space around them is still squashed.
+sub _protect_verbatim :Private {
+	my $body_ref = shift;
+
+	# A marker that does not already occur, so restoring is exact.  NUL
+	# never matches \s, so no squash pattern can touch a placeholder.
+	my $marker = "\x00MPB";
+	$marker .= "\x00" while index($$body_ref, $marker) >= 0;
+
+	my @saved;
+	$$body_ref =~ s{$VERBATIM_ELEMENT}{
+		push(@saved, $3);
+		$1 . $marker . $#saved . $marker . $4;
+	}ge;
+
+	return {marker => $marker, saved => \@saved};
+}
+
+# Purpose:        Put back what _protect_verbatim took out.
+# Entry criteria: $vault came from _protect_verbatim on this body.
+# Exit status:    The HTML with every placeholder restored.
+# Side effects:   None.
+sub _restore_verbatim :Private {
+	my ($body, $vault) = @_;
+
+	my ($marker, $saved) = @{$vault}{qw(marker saved)};
+	$body =~ s{\Q$marker\E(\d+)\Q$marker\E}{$saved->[$1]}g if @$saved;
+
 	return $body;
 }
 
-sub _rewrite_links {
+# Purpose:        Make links back to this site relative.
+# Entry criteria: $body is HTML; $c is the current controller.
+# Exit status:    The rewritten HTML, or undef when the request has no
+#                 host to compare against.
+# Side effects:   None.
+sub _rewrite_links :Private {
 	my ($body, $c) = @_;
 
 	my $url = eval { $c->req->url->to_abs };
-	return undef unless $url;
-
-	my $host = $url->host;
+	my $host = $url ? $url->host : undef;
 	return undef unless defined($host) && length($host);
 
 	my $authority = $url->host_port // $host;
-	my $scheme = $url->scheme // 'http';
+	my $origin = quotemeta(($url->scheme // 'http') . "://$authority");
+	my $relative = quotemeta("//$authority");
 
-	my $origin = quotemeta "$scheme://$authority";
-	my $relative = quotemeta "//$authority";
-
-	$body =~ s{<a\s+?href="$origin"}{<a href="/"}gim;
-	$body =~ s{<a\s+?href="$origin/}{<a href="/}gim;
-	$body =~ s{<a\s+?href="$relative/}{<a href="/}gim;
-	$body =~ s{<img\s+?src="$origin"}{<img src="/"}gim;
-	$body =~ s{<img\s+?src="$origin/}{<img src="/}gim;
-	$body =~ s{<img\s+?src="$relative/}{<img src="/}gim;
+	# The site root becomes "/", anything beneath it a root-relative path
+	for my $link (@LINK_ATTRIBUTES) {
+		my ($tag, $attribute) = @$link;
+		$body =~ s{<$tag\s+?$attribute="$origin"}{<$tag $attribute="/"}gi;
+		$body =~ s{<$tag\s+?$attribute="(?:$origin|$relative)/}{<$tag $attribute="/}gi;
+	}
 
 	# A link to the current page with a query string only needs the query
 	# string, e.g. href="/search?q=perl" becomes href="?q=perl"
-	my $path = quotemeta $c->req->url->path->to_string;
-	if (length($path) > 1) {
-		$body =~ s{<a\s+?href="$path\?}{<a href="?}gim;
-	}
+	my $path = $c->req->url->path->to_string;
+	$body =~ s{<a\s+?href="\Q$path\E\?}{<a href="?}gi if length($path) > 1;
 
 	return $body;
 }
 
-# Pick the best content coding from an Accept-Encoding header.
-# Returns undef when identity should be used.
-sub _negotiate_encoding {
+# ---------------------------------------------------------------------------
+# Content coding
+# ---------------------------------------------------------------------------
+
+# Purpose:        Pick the best content coding from an Accept-Encoding
+#                 header.
+# Entry criteria: $supported is the server's list in preference order.
+# Exit status:    A coding name, or undef when identity should be used.
+# Side effects:   None.
+sub _negotiate_encoding :Private {
 	my ($accept, $supported) = @_;
 
-	return undef unless defined($accept) && length($accept);
-	return undef unless $supported && @$supported;
+	return undef unless defined($accept) && length($accept) && $supported && @$supported;
 
+	# Highest q per coding, with "*" as the fallback for unlisted ones
 	my (%quality, $wildcard);
-	for my $part (split /\s*,\s*/, $accept) {
-		next unless length($part);
-
-		my ($token, @params) = split /\s*;\s*/, $part;
+	for my $coding (@{split_header($accept)}) {
+		my ($token, undef, %params) = @$coding;
 		next unless defined($token) && length($token);
 
-		$token = lc $token;
-		$token = 'gzip' if $token eq 'x-gzip';
-
-		my $q = 1;
-		for my $param (@params) {
-			$q = $1 + 0 if $param =~ /^q\s*=\s*([0-9.]+)$/i;
-		}
-		$q = 0 if $q < 0;
-		$q = 1 if $q > 1;
-
-		if ($token eq '*') {
+		my $name = _canonical_encoding($token);
+		my $q = _quality(\%params);
+		if ($name eq '*') {
 			$wildcard = $q;
-		} elsif (!exists($quality{$token}) || ($q > $quality{$token})) {
-			$quality{$token} = $q;
+		} elsif (!exists($quality{$name}) || ($q > $quality{$name})) {
+			$quality{$name} = $q;
 		}
 	}
 
+	# Server order breaks ties, so the first equal-best coding wins
 	my ($best, $best_quality);
 	for my $encoding (@$supported) {
-		my $q = exists($quality{$encoding}) ? $quality{$encoding} : (defined($wildcard) ? $wildcard : 0);
+		my $q = $quality{$encoding} // $wildcard // 0;
 		next if $q <= 0;
-		if (!defined($best_quality) || ($q > $best_quality)) {
-			$best = $encoding;
-			$best_quality = $q;
-		}
+		($best, $best_quality) = ($encoding, $q) if !defined($best_quality) || ($q > $best_quality);
 	}
 
 	return $best;
 }
 
-sub _encode_body {
+# Purpose:        Read the q parameter of one Accept-Encoding entry.
+# Entry criteria: $params maps parameter names to values.
+# Exit status:    A quality between 0 and 1; 1 if absent or unreadable.
+# Side effects:   None.
+sub _quality :Private {
+	my $params = shift;
+
+	my %lower = map { lc($_) => $params->{$_} } keys %$params;
+	my $q = (defined($lower{q}) && looks_like_number($lower{q})) ? $lower{q} + 0 : 1;
+
+	return ($q < 0) ? 0 : ($q > 1) ? 1 : $q;
+}
+
+# Purpose:        Normalise a content coding name.
+# Entry criteria: Any value.
+# Exit status:    The lower-cased name, with legacy aliases resolved.
+# Side effects:   None.
+sub _canonical_encoding :Private {
+	my $name = lc(shift // '');
+
+	return $ENCODING_ALIAS{$name} // $name;
+}
+
+# Purpose:        Compress bytes with one coding.
+# Entry criteria: $encoding is a key of %ENCODERS.
+# Exit status:    {body => $compressed} or {error => $text}.
+# Side effects:   Loads the coding's module on first use.
+sub _encode_body :Private {
 	my ($encoding, $bytes) = @_;
 
-	my $compressed;
-	my $ok = eval {
-		if ($encoding eq 'gzip') {
-			$compressed = gzip($bytes);
-		} elsif ($encoding eq 'br') {
-			require IO::Compress::Brotli;
-			$compressed = IO::Compress::Brotli::bro($bytes);
-		} elsif ($encoding eq 'zstd') {
-			require Compress::Zstd;
-			$compressed = Compress::Zstd::compress(\$bytes);
-		} else {
-			die "unknown encoding $encoding";
-		}
-		1;
+	my $encoder = $ENCODERS{$encoding};
+	my $body = eval {
+		$encoder ? $encoder->($bytes) : croak(__PACKAGE__->i18n('unknown_encoding', {encoding => $encoding}));
 	};
 
-	return (undef, $@) unless $ok;
-	return (undef, undef) unless defined($compressed);
-	return ($compressed, undef);
+	return $@ ? {error => $@} : {body => $body};
 }
 
-sub _etag_matches {
+# ---------------------------------------------------------------------------
+# Small header helpers
+# ---------------------------------------------------------------------------
+
+# Purpose:        Compare If-None-Match with this response's tag, using
+#                 the weak comparison RFC 7232 requires for it.
+# Entry criteria: Both arguments are defined.
+# Exit status:    1 if any listed tag, or "*", matches; else 0.
+# Side effects:   None.
+sub _etag_matches :Private {
 	my ($if_none_match, $etag) = @_;
 
-	my $mine = $etag;
-	$mine =~ s{^W/}{};
-	for my $candidate (map { _trim($_) } split /,/, $if_none_match) {
-		next unless length($candidate);
-		return 1 if $candidate eq '*';
+	(my $mine = $etag) =~ s{^W/}{};
+
+	my $match = 0;
+	for my $candidate (grep { length } map { trim($_) } split(/,/, $if_none_match)) {
 		$candidate =~ s{^W/}{};
-		return 1 if $candidate eq $mine;
+		$match ||= ($candidate eq '*') || ($candidate eq $mine);
 	}
 
-	return 0;
+	return $match ? 1 : 0;
 }
 
-sub _resolve_last_modified {
-	my ($option, $c, $state) = @_;
-
-	return undef unless $option;
-
-	if (ref $option eq 'CODE') {
-		my $value = $option->($c);
-		return undef unless defined($value);
-		return _resolve_last_modified($value, $c, $state);
-	}
-
-	return undef if ref $option;
-
-	if ($option eq '1') {
-		return _application_mtime($c, $state);
-	}
-
-	return $option + 0 if $option =~ /^\d+$/;
-
-	my $epoch = eval { Mojo::Date->new($option)->epoch };
-
-	return $epoch;
-}
-
-sub _add_vary {
+# Purpose:        Say that the representation depends on Accept-Encoding.
+# Entry criteria: $headers is a Mojo::Headers.
+# Exit status:    $headers.
+# Side effects:   Appends Accept-Encoding to Vary unless already listed.
+sub _add_vary :Private {
 	my $headers = shift;
 
-	my $vary = $headers->vary // '';
-	return if grep { lc($_) eq 'accept-encoding' } map { _trim($_) } split /,/, $vary;
-	$headers->vary(length($vary) ? "$vary, Accept-Encoding" : 'Accept-Encoding');
+	my $listed = grep { lc(trim($_)) eq 'accept-encoding' } split(/,/, $headers->vary // '');
+	$headers->append(Vary => 'Accept-Encoding') unless $listed;
+
+	return $headers;
 }
 
-sub _trim {
-	my $value = shift;
-
-	$value =~ s/^\s+//;
-	$value =~ s/\s+$//;
-
-	return $value;
-}
-
-sub _mime_type {
+# Purpose:        Extract the media type from a Content-Type value.
+# Entry criteria: Any value.
+# Exit status:    The lower-cased type/subtype, or undef.
+# Side effects:   None.
+sub _mime_type :Private {
 	my $content_type = shift;
 
-	return undef unless defined($content_type) && length($content_type);
-	$content_type =~ /^\s*([\w.+-]+\/[\w.+-]+)/ or return undef;
+	my ($type) = ($content_type // '') =~ m{^\s*([\w.+-]+/[\w.+-]+)};
 
-	return lc $1;
+	return defined($type) ? lc($type) : undef;
 }
 
-sub _matches {
+# Purpose:        Match a media type against a list of strings and regexes.
+# Entry criteria: $type is lower-case; $patterns is an array reference.
+# Exit status:    1 if any entry matches, else 0.
+# Side effects:   None.
+sub _matches :Private {
 	my ($type, $patterns) = @_;
 
-	return 0 unless $patterns && ref($patterns) eq 'ARRAY';
-	for my $pattern (@$patterns) {
-		if (ref $pattern eq 'Regexp') {
-			return 1 if $type =~ $pattern;
-		} elsif (defined($pattern) && (lc($pattern) eq $type)) {
-			return 1;
-		}
+	my $found = 0;
+	for my $pattern ((ref($patterns) eq 'ARRAY') ? @$patterns : ()) {
+		$found ||= (ref($pattern) eq 'Regexp')
+			? scalar($type =~ $pattern)
+			: (defined($pattern) && (lc($pattern) eq $type));
 	}
 
-	return 0;
+	return $found ? 1 : 0;
 }
 
 1;	# End of Mojolicious::Plugin::Buffer
@@ -1844,39 +2737,39 @@ A complete application:
     use CHI;
 
     sub startup {
-        my $self = shift;
+	my $self = shift;
 
-        $self->config(hypnotoad => {
-            listen   => ['http://*:8080'],
-            workers  => 4,
-            pid_file => '/var/lib/myapp/hypnotoad.pid',
-        });
+	$self->config(hypnotoad => {
+	    listen   => ['http://*:8080'],
+	    workers  => 4,
+	    pid_file => '/var/lib/myapp/hypnotoad.pid',
+	});
 
-        $self->plugin('Buffer' => {
-            optimise_content => 1,
-            cache => CHI->new(
-                driver    => 'File',
-                root_dir  => '/var/cache/myapp/buffer',
-                namespace => 'pages',
-            ),
-            cache_lock_dir => '/var/lib/myapp/buffer-locks',
-            cache_duration => '10 minutes',
-        });
+	$self->plugin('Buffer' => {
+	    optimise_content => 1,
+	    cache => CHI->new(
+		driver    => 'File',
+		root_dir  => '/var/cache/myapp/buffer',
+		namespace => 'pages',
+	    ),
+	    cache_lock_dir => '/var/lib/myapp/buffer-locks',
+	    cache_duration => '10 minutes',
+	});
 
-        $self->routes->get('/expensive' => sub {
-            my $c = shift;
-            return if $c->buffer_is_cached;
+	$self->routes->get('/expensive' => sub {
+	    my $c = shift;
+	    return if $c->buffer_is_cached;
 
-            # ... expensive work ...
+	    # ... expensive work ...
 
-            $c->render(template => 'expensive');
-        });
+	    $c->render(template => 'expensive');
+	});
     }
 
     1;
 
-A runnable copy of this example, with its paths under C<eg/hypnotoad>, is
-included as F<eg/hypnotoad>.
+A runnable copy of this example, with its paths under C<examples/hypnotoad>,
+is included as F<examples/hypnotoad>.
 
 C<script/my_app> is the usual launcher:
 
@@ -1923,26 +2816,26 @@ L<Redis> client:
     use Redis;
 
     my $redis = sub {
-        Redis->new(
-            server        => 'redis://redis.internal:6379',
-            cnx_timeout   => 1,
-            read_timeout  => 1,
-            write_timeout => 1,
-        );
+	Redis->new(
+	    server        => 'redis://redis.internal:6379',
+	    cnx_timeout   => 1,
+	    read_timeout  => 1,
+	    write_timeout => 1,
+	);
     };
 
     $app->plugin('Buffer' => {
-        cache => CHI->new(
-            driver    => 'Memcached',
-            servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
-            namespace => 'pages',
-        ),
-        cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
-            redis     => $redis,
-            namespace => 'myapp:buffer:',
-            ttl       => 60,
-        ),
-        cache_duration => '10 minutes',
+	cache => CHI->new(
+	    driver    => 'Memcached',
+	    servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
+	    namespace => 'pages',
+	),
+	cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
+	    redis     => $redis,
+	    namespace => 'myapp:buffer:',
+	    ttl       => 60,
+	),
+	cache_duration => '10 minutes',
     });
 
 The C<ttl> must be longer than L</cache_lock_timeout> and longer than the
@@ -1991,6 +2884,11 @@ run out rather than sleeping a fixed margin; set C<MPB_REDIS_TTL> to widen
 that further on a heavily loaded machine.  The normal test suite does not
 require a Redis server.
 
+The private routines are guarded by L<Sub::Private> in C<enforce> mode and
+L<Sub::Protected>.  Both stand aside while C<HARNESS_ACTIVE> is set, so the
+white-box tests can reach them under C<prove>; F<t/16-encapsulation.t> turns
+that bypass off to check the guards themselves.
+
 =head2 Why a plugin?
 
 L<CGI::Buffer> replaces C<STDOUT> with an in-memory buffer and does its work
@@ -2020,12 +2918,16 @@ generation feature rather than a response filter and is not part of this
 plugin.  The server-side cache is available as the opt-in
 L</buffer_is_cached> helper described above.
 
-=head1 CAVEATS
+=head1 LIMITATIONS
 
 =over 4
 
 =item * Only in-memory responses are processed.  Static files
 (C<Mojo::Asset::File>) and streaming responses are left alone.
+
+=item * The whole response is held in memory, more than once while it is
+being optimised and compressed.  There is no size limit; a very large
+generated body costs several times its size in a worker.
 
 =item * Responses that already have a C<Content-Encoding>, for example from
 C<$app-E<gt>renderer-E<gt>compress>, are not compressed again.
@@ -2039,9 +2941,16 @@ for each coding.
 responses that are streamed with C<$c-E<gt>write> (server-sent events,
 long-polling and so on).  C<text/event-stream> is excluded by default.
 
-=item * Optimising HTML rewrites the document.  Use
-C<optimise_content =E<gt> 0> on pages where every byte matters to scripts, or
-disable it per response with C<$c-E<gt>stash(buffer =E<gt> {optimise_content =E<gt> 0})>.
+=item * The HTML optimiser is a set of regular expressions inherited from
+L<CGI::Buffer>, not an HTML parser.  It protects the content of
+C<E<lt>preE<gt>>, C<E<lt>textareaE<gt>>, C<E<lt>scriptE<gt>> and
+C<E<lt>styleE<gt>>, but white space made significant by CSS
+(C<white-space: pre> on another element) is still collapsed, and some rules
+(for example merging adjacent C<E<lt>centerE<gt>> blocks) change the
+document slightly.  Use C<optimise_content =E<gt> 0> on pages where every
+byte matters, or disable it per response with
+C<$c-E<gt>stash(buffer =E<gt> {optimise_content =E<gt> 0})>.  Link rewriting
+only recognises double-quoted attributes.
 
 =item * The server-side cache is opt-in: a page is only stored if its action
 calls L</buffer_is_cached>.  An action that forgets to call it is never
@@ -2058,13 +2967,34 @@ C<vary_by =E<gt> []> for genuinely public pages, or L</cache_key>.
 keeps its own in-flight table, so a cold entry can be built once per worker;
 set L</cache_lock> or L</cache_lock_dir> to coalesce across workers, with a
 shared cache.  A request waiting on an in-flight response is answered with
-C<503> if that
-response fails, cannot be cached, or exceeds L</cache_lock_timeout>, rather
-than running the action a second time.
+C<503> if that response fails, cannot be cached, or exceeds
+L</cache_lock_timeout>, rather than running the action a second time.  A
+waiter in another worker polls the cache every 100 milliseconds, so it can
+be answered up to that much later than the builder finishes.
 
 =item * Entries are invalidated when the application script or a template
 path changes, but not when data or configuration changes.  The TTL is the
 backstop for those.
+
+=item * Options in the C<buffer> stash and group declarations are not
+validated the way C<plugin()> options are.  A bad C<cache_lock_timeout>
+there falls back to the default; other bad values are used as given.
+
+=item * The lock backend protocol returns two-element lists rather than
+references.  That is the documented interface third-party backends already
+implement, so it was kept.
+
+=item * Every private routine is wrapped by L<Sub::Private> or
+L<Sub::Protected>, which costs a C<caller> check on each call.  The plugin
+makes a few hundred such calls per response, which is small next to MD5,
+compression and template rendering, but it is not free.  The modules also
+add L<Readonly>, L<Params::Validate::Strict> and their dependencies to what
+was a Mojolicious-only plugin, and C<use autodie qw(:all)> requires
+L<IPC::System::Simple> even though the plugin never runs an external
+command.
+
+=item * The C<503> text is chosen per application through L</messages>; it
+is not negotiated from C<Accept-Language>.
 
 =back
 
@@ -2072,7 +3002,8 @@ backstop for those.
 
 L<CGI::Buffer>, L<FCGI::Buffer>, L<CHI>, L<HTML::Packer>,
 L<Mojolicious::Plugin>, L<Mojolicious::Plugin::Buffer::Lock::File>,
-L<Mojolicious::Plugin::Buffer::Lock::Redis>
+L<Mojolicious::Plugin::Buffer::Lock::Redis>,
+L<Mojolicious::Plugin::Buffer::I18N>
 
 =head1 AUTHOR
 

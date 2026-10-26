@@ -7,11 +7,11 @@ use File::Spec ();
 use Mojo::Home;
 use Test::Mojo;
 
-# Runs the example in eg/grouped-sections, so the group declarations it
+# Runs the example in examples/grouped-sections, so the group declarations it
 # documents are exercised rather than merely shown.
 
 my $root    = dirname(dirname(File::Spec->rel2abs($0)));
-my $example = File::Spec->catdir($root, 'eg', 'grouped-sections');
+my $example = File::Spec->catdir($root, 'examples', 'grouped-sections');
 plan skip_all => 'the grouped-sections example is missing'
 	unless -f File::Spec->catfile($example, 'lib', 'GroupedSections.pm');
 
