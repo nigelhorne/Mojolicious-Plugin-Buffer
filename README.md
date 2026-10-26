@@ -103,7 +103,60 @@ that were built with `$c->res->body` rather than `$c->render`.
 ## Options
 
 All options can be given to `plugin()` and, except where noted, overridden
-per request through the `buffer` stash value.
+per request through the `buffer` stash value.  A few describe a section of a
+site rather than one page and can be declared once for it; see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages).
+
+### Declaring Options for a Group of Pages
+
+```perl
+# one route
+$r->get('/about' => {optimise_content => 1} => sub {...});
+
+# everything beneath an under route
+my $docs = $r->under('/docs')->to(optimise_content => 1);
+$docs->get('/intro' => sub {...});
+
+# a controller, and through a base class its whole namespace
+package MyApp::Controller::Docs;
+use Mojo::Base 'Mojolicious::Controller';
+has buffer_optimise_content => 1;
+```
+
+A route default is an ordinary stash value, so `$app->defaults(...)` and a
+`before_action` that sets one work as well.  The controller form is a method
+named `buffer_` followed by the option name, and is only consulted when the
+stash says nothing: `has` is the declarative way to write it, and a plain
+`sub buffer_optimise_content { 1 }` covers a value that depends on the request.
+
+The most specific declaration wins:
+
+1. the `buffer` stash, for a single response
+2. a route default, which includes one an `under` route sets
+3. the controller declaration
+4. the plugin option
+
+A route default of `0` therefore opts one page back out of a group that has
+the option on, and the `buffer` stash overrides both.
+
+Only the options that describe the content of a section are declarable:
+
+- ["compress\_content"](#compress_content) - a section serving files that are
+  already compressed
+- ["optimise\_content"](#optimise_content) - a static section that is always
+  minified
+- ["rewrite\_links"](#rewrite_links) - a section whose HTML is used elsewhere,
+  so its absolute links must survive
+- ["trust\_last\_modified"](#trust_last_modified) - a section that renders
+  templates and nothing else
+
+Everything else, including ["generate\_etag"](#generate_etag) and
+["generate\_304"](#generate_304), stays a per-response or per-application
+decision; those sections say why.  Any option can still be set for one
+response through the `buffer` stash.
+
+[`eg/grouped-sections`](eg/grouped-sections/README.md) is a runnable site with
+one section declared on an `under` route and one declared in a controller.
 
 ### Compress\_Content
 
@@ -112,19 +165,9 @@ remember that the plugin turns off ["compress" in Mojolicious::Renderer](https:/
 response will then not be compressed at all).  The encodings offered to
 clients are controlled by ["encodings"](#encodings).
 
-Like ["optimise\_content"](#optimise_content), it can be declared once for a group of pages, which
-is the point of a section that serves files it has already compressed:
-
-```perl
-my $assets = $r->under('/assets')->to(compress_content => 0);
-
-package MyApp::Controller::Assets;
-use Mojo::Base 'Mojolicious::Controller';
-has buffer_compress_content => 0;
-```
-
-A route default raises or lowers it for that route, the declaration beats the
-plugin option, and the `buffer` stash overrides both.
+It can be declared for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which
+is the point of a section that serves files it has already compressed.
 
 ### Optimise\_Content
 
@@ -143,21 +186,9 @@ squashing and link rewriting still run, but comments and embedded CSS and
 JavaScript are left alone, as they are by [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and
 [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  Install [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) for the full effect.
 
-Like ["trust\_last\_modified"](#trust_last_modified), it can be declared once for a group of pages,
-as a route default, an `under` route or a controller method:
-
-```perl
-$r->get('/about' => {optimise_content => 1} => sub {...});
-my $docs = $r->under('/docs')->to(optimise_content => 1);
-
-package MyApp::Controller::Docs;
-use Mojo::Base 'Mojolicious::Controller';
-has buffer_optimise_content => 1;
-```
-
-A declaration beats the plugin option, a route default of `0` turns
-optimisation off inside a group that has it on, and the `buffer` stash
-overrides both.
+It can be declared for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a
+static section that is always minified.
 
 ### Rewrite\_Links
 
@@ -166,14 +197,11 @@ point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
 Defaults to 1.  Has no effect unless ["optimise\_content"](#optimise_content) is enabled.
 
-It is declared for a group of pages in the same way as ["optimise\_content"](#optimise_content),
-which matters for a section whose HTML is not used in place: a preview of a
+It can be declared for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which
+matters for a section whose HTML is not used in place: a preview of a
 newsletter or a page rendered for another site needs its absolute URLs kept
 while still being optimised elsewhere.
-
-```perl
-my $preview = $r->under('/preview')->to(optimise_content => 1, rewrite_links => 0);
-```
 
 ### Generate\_Etag
 
@@ -182,11 +210,12 @@ defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
 representation of the same page have different tags.
 
-Unlike ["optimise\_content"](#optimise_content), this is not declarable for a group of pages: it
-is a per-endpoint decision about whether a digest is worth computing, not a
-policy for a section of the site.  Skip the digest for one response with
-`$c->stash(buffer => {generate_etag => 0})`, or for the whole
-application with the plugin option.
+It is not declarable for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)):
+whether a digest is worth computing is a decision for one endpoint, not a
+policy for a section.  Skip the digest for one response with
+`$c->stash(buffer => {generate_etag => 0})`, or for the whole application with
+the plugin option.
 
 ### Generate\_304
 
@@ -204,12 +233,13 @@ current, so with an `ETag` available only the tag can revalidate the
 response.  Clients that have the tag, which includes browsers after the first
 `200`, send `If-None-Match` and are unaffected.
 
-Like ["generate\_etag"](#generate_etag), this is not declarable for a group of pages.  It is
-the switch that decides whether a client is told its copy is current, and a
-group that also sets ["trust\_last\_modified"](#trust_last_modified) would contradict itself if it
-could turn the answer off as well.  Use
-`$c->stash(buffer => {generate_304 => 0})` where one endpoint must always
-send a body.
+It is not declarable for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)):
+it decides whether a client is told its copy is current, so a section that
+could also turn the answer off would contradict
+["trust\_last\_modified"](#trust_last_modified).  Use
+`$c->stash(buffer => {generate_304 => 0})` where one endpoint must always send
+a body.
 
 ### Last\_Modified
 
@@ -269,38 +299,12 @@ plugin 'Buffer' => {
 Use it per response instead with `$c->stash(buffer => {trust_last_modified
 &#x3d;> 1})` when only some pages are that predictable.
 
-A whole group of pages can opt in once.  The easiest way is a route default,
-which [Mojolicious](https://metacpan.org/pod/Mojolicious) copies into the stash:
-
-```perl
-# one route
-$r->get('/about' => {trust_last_modified => 1} => sub {...});
-
-# everything beneath an under route
-my $docs = $r->under('/docs')->to(trust_last_modified => 1);
-$docs->get('/intro' => sub {...});
-```
-
-A controller can declare it for itself and, through a base class, for its
-whole namespace:
-
-```perl
-package MyApp::Controller::Docs;
-use Mojo::Base 'Mojolicious::Controller';
-has buffer_trust_last_modified => 1;
-
-sub intro { shift->render(template => 'docs/intro') }
-```
-
-A plain `sub buffer_trust_last_modified { 1 }` works too, for a value that
-depends on something the controller knows at request time.
-
-A route default wins over the controller declaration, so a route default of
-`0` opts one page back out of a trusting namespace, and the `buffer` stash
-overrides both.  The declaration has no effect when ["generate\_304"](#generate_304) is off,
-and it cannot make a page safe: it only says that the application and its
-templates really are the only inputs.  ["optimise\_content"](#optimise_content) can be declared
-for a group in the same way.
+It can be declared for a group of pages (see
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a
+section that renders templates and nothing else.  The declaration has no
+effect when ["generate\_304"](#generate_304) is off, and it cannot make a page
+safe: it only says that the application and its templates really are the only
+inputs.
 
 ### Last-Modified Performance
 

@@ -64,3 +64,8 @@ Revision history for Mojolicious-Plugin-Buffer
 	pre-compressed files can opt out once, and for rewrite_links, so a
 	section whose HTML is used elsewhere keeps its absolute links.  Leave
 	generate_etag and generate_304 per-endpoint, and say why.
+	Document the group declaration once in the options list, with a table of
+	which options support it, instead of repeating the rules per option.
+	Add a runnable grouped-sections example under eg/grouped-sections, with
+	one section declared on an under route and one in a controller, and a
+	test that runs it and asserts both declarations.

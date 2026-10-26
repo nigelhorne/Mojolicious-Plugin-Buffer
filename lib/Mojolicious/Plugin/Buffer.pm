@@ -163,7 +163,71 @@ that were built with C<$c-E<gt>res-E<gt>body> rather than C<$c-E<gt>render>.
 =head1 OPTIONS
 
 All options can be given to C<plugin()> and, except where noted, overridden
-per request through the C<buffer> stash value.
+per request through the C<buffer> stash value.  A few describe a section of a
+site rather than one page and can be declared once for it; see
+L</Declaring options for a group of pages>.
+
+=head2 Declaring options for a group of pages
+
+    # one route
+    $r->get('/about' => {optimise_content => 1} => sub {...});
+
+    # everything beneath an under route
+    my $docs = $r->under('/docs')->to(optimise_content => 1);
+    $docs->get('/intro' => sub {...});
+
+    # a controller, and through a base class its whole namespace
+    package MyApp::Controller::Docs;
+    use Mojo::Base 'Mojolicious::Controller';
+    has buffer_optimise_content => 1;
+
+A route default is an ordinary stash value, so C<< $app->defaults(...) >> and
+a C<before_action> that sets one work as well.  The controller form is a
+method named C<buffer_> followed by the option name, and is only consulted
+when the stash says nothing: C<has> is the declarative way to write it, and a
+plain C<sub buffer_optimise_content { 1 }> covers a value that depends on the
+request.
+
+The most specific declaration wins:
+
+=over 4
+
+=item 1. the C<buffer> stash, for a single response
+
+=item 2. a route default, which includes one an C<under> route sets
+
+=item 3. the controller declaration
+
+=item 4. the plugin option
+
+=back
+
+A route default of C<0> therefore opts one page back out of a group that has
+the option on, and the C<buffer> stash overrides both.
+
+Only the options that describe the content of a section are declarable:
+
+=over 4
+
+=item L</compress_content> - a section serving files that are already
+compressed
+
+=item L</optimise_content> - a static section that is always minified
+
+=item L</rewrite_links> - a section whose HTML is used elsewhere, so its
+absolute links must survive
+
+=item L</trust_last_modified> - a section that renders templates and nothing
+else
+
+=back
+
+Everything else, including L</generate_etag> and L</generate_304>, stays a
+per-response or per-application decision; those sections say why.  Any option
+can still be set for one response through the C<buffer> stash.
+
+F<eg/grouped-sections> is a runnable site with one section declared on an
+C<under> route and one declared in a controller.
 
 =head2 compress_content
 
@@ -172,17 +236,9 @@ remember that the plugin turns off L<Mojolicious::Renderer/compress>, so a
 response will then not be compressed at all).  The encodings offered to
 clients are controlled by L</encodings>.
 
-Like L</optimise_content>, it can be declared once for a group of pages, which
-is the point of a section that serves files it has already compressed:
-
-    my $assets = $r->under('/assets')->to(compress_content => 0);
-
-    package MyApp::Controller::Assets;
-    use Mojo::Base 'Mojolicious::Controller';
-    has buffer_compress_content => 0;
-
-A route default raises or lowers it for that route, the declaration beats the
-plugin option, and the C<buffer> stash overrides both.
+It can be declared for a group of pages (see
+L</Declaring options for a group of pages>), which is the point of a section
+that serves files it has already compressed.
 
 =head2 optimise_content
 
@@ -207,19 +263,9 @@ squashing and link rewriting still run, but comments and embedded CSS and
 JavaScript are left alone, as they are by L<CGI::Buffer> and
 L<FCGI::Buffer>.  Install L<HTML::Packer> for the full effect.
 
-Like L</trust_last_modified>, it can be declared once for a group of pages,
-as a route default, an C<under> route or a controller method:
-
-    $r->get('/about' => {optimise_content => 1} => sub {...});
-    my $docs = $r->under('/docs')->to(optimise_content => 1);
-
-    package MyApp::Controller::Docs;
-    use Mojo::Base 'Mojolicious::Controller';
-    has buffer_optimise_content => 1;
-
-A declaration beats the plugin option, a route default of C<0> turns
-optimisation off inside a group that has it on, and the C<buffer> stash
-overrides both.
+It can be declared for a group of pages (see
+L</Declaring options for a group of pages>), for a static section that is
+always minified.
 
 =head2 rewrite_links
 
@@ -228,12 +274,11 @@ point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
 Defaults to 1.  Has no effect unless L</optimise_content> is enabled.
 
-It is declared for a group of pages in the same way as L</optimise_content>,
-which matters for a section whose HTML is not used in place: a preview of a
-newsletter or a page rendered for another site needs its absolute URLs kept
-while still being optimised elsewhere.
-
-    my $preview = $r->under('/preview')->to(optimise_content => 1, rewrite_links => 0);
+It can be declared for a group of pages (see
+L</Declaring options for a group of pages>), which matters for a section
+whose HTML is not used in place: a preview of a newsletter or a page rendered
+for another site needs its absolute URLs kept while still being optimised
+elsewhere.
 
 =head2 generate_etag
 
@@ -242,11 +287,11 @@ defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
 representation of the same page have different tags.
 
-Unlike L</optimise_content>, this is not declarable for a group of pages: it
-is a per-endpoint decision about whether a digest is worth computing, not a
-policy for a section of the site.  Skip the digest for one response with
-C<< $c->stash(buffer => {generate_etag => 0}) >>, or for the whole
-application with the plugin option.
+It is not declarable for a group of pages (see
+L</Declaring options for a group of pages>): whether a digest is worth
+computing is a decision for one endpoint, not a policy for a section.  Skip
+the digest for one response with C<< $c->stash(buffer => {generate_etag => 0})
+>>, or for the whole application with the plugin option.
 
 =head2 generate_304
 
@@ -264,10 +309,10 @@ current, so with an C<ETag> available only the tag can revalidate the
 response.  Clients that have the tag, which includes browsers after the first
 C<200>, send C<If-None-Match> and are unaffected.
 
-Like L</generate_etag>, this is not declarable for a group of pages.  It is
-the switch that decides whether a client is told its copy is current, and a
-group that also sets L</trust_last_modified> would contradict itself if it
-could turn the answer off as well.  Use
+It is not declarable for a group of pages (see
+L</Declaring options for a group of pages>): it decides whether a client is
+told its copy is current, so a section that could also turn the answer off
+would contradict L</trust_last_modified>.  Use
 C<< $c->stash(buffer => {generate_304 => 0}) >> where one endpoint must always
 send a body.
 
@@ -335,34 +380,11 @@ even here:
 Use it per response instead with C<< $c->stash(buffer => {trust_last_modified
 => 1}) >> when only some pages are that predictable.
 
-A whole group of pages can opt in once.  The easiest way is a route default,
-which L<Mojolicious> copies into the stash:
-
-    # one route
-    $r->get('/about' => {trust_last_modified => 1} => sub {...});
-
-    # everything beneath an under route
-    my $docs = $r->under('/docs')->to(trust_last_modified => 1);
-    $docs->get('/intro' => sub {...});
-
-A controller can declare it for itself and, through a base class, for its
-whole namespace:
-
-    package MyApp::Controller::Docs;
-    use Mojo::Base 'Mojolicious::Controller';
-    has buffer_trust_last_modified => 1;
-
-    sub intro { shift->render(template => 'docs/intro') }
-
-A plain C<sub buffer_trust_last_modified { 1 }> works too, for a value that
-depends on something the controller knows at request time.
-
-A route default wins over the controller declaration, so a route default of
-C<0> opts one page back out of a trusting namespace, and the C<buffer> stash
-overrides both.  The declaration has no effect when L</generate_304> is off,
-and it cannot make a page safe: it only says that the application and its
-templates really are the only inputs.  L</optimise_content> can be declared
-for a group in the same way.
+It can be declared for a group of pages (see
+L</Declaring options for a group of pages>), for a section that renders
+templates and nothing else.  The declaration has no effect when
+L</generate_304> is off, and it cannot make a page safe: it only says that the
+application and its templates really are the only inputs.
 
 =head2 Last-Modified performance
 
