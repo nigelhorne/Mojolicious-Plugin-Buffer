@@ -123,4 +123,71 @@ subtest 'level 2 works without HTML::Packer' => sub {
 	unlike($log, qr/HTML::Packer failed/, 'no HTML::Packer failure is logged');
 };
 
+{
+	package TestBuffer::Controller::Optimised;
+	use Mojo::Base 'Mojolicious::Controller';
+
+	has buffer_optimise_content => 1;
+
+	sub page { shift->render(text => '<div>   <p>Hello   World</p>   </div>') }
+}
+
+{
+	package TestBuffer::Controller::PlainPage;
+	use Mojo::Base 'Mojolicious::Controller';
+
+	sub page { shift->render(text => '<div>   <p>Hello   World</p>   </div>') }
+}
+
+subtest 'optimise_content can be declared for a group of pages' => sub {
+	my $page     = '<div>   <p>Hello   World</p>   </div>';
+	my $squashed = qr{<div><p>Hello World</p></div>};
+	my $original = qr{   <p>Hello   World</p>   };
+
+	my $group_app = Mojolicious->new;
+	$group_app->log->level('error');
+	$group_app->plugin('Buffer');
+
+	my $r = $group_app->routes;
+	$r->get('/route' => {optimise_content => 1} => sub { shift->render(text => $page) });
+	$r->get('/plain' => sub { shift->render(text => $page) });
+
+	my $docs = $r->under('/docs')->to(optimise_content => 1);
+	$docs->get('/one' => sub { shift->render(text => $page) });
+	$docs->get('/raw' => {optimise_content => 0} => sub { shift->render(text => $page) });
+	$docs->get('/override' => sub {
+		my $c = shift;
+		$c->stash(buffer => {optimise_content => 0});
+		$c->render(text => $page);
+	});
+
+	$r->namespaces(['TestBuffer::Controller']);
+	$r->get('/static')->to('Optimised#page');
+	$r->get('/volatile')->to('PlainPage#page');
+
+	my $group = Test::Mojo->new($group_app);
+	$group->ua->transactor->compressed(0);
+
+	$group->get_ok('/route')->status_is(200);
+	like($group->tx->res->body, $squashed, 'a route default optimises that route');
+
+	$group->get_ok('/docs/one')->status_is(200);
+	like($group->tx->res->body, $squashed, 'an under route optimises everything below it');
+
+	$group->get_ok('/static')->status_is(200);
+	like($group->tx->res->body, $squashed, 'a controller declaration optimises its namespace');
+
+	$group->get_ok('/plain')->status_is(200);
+	like($group->tx->res->body, $original, 'a page outside the group is untouched');
+
+	$group->get_ok('/volatile')->status_is(200);
+	like($group->tx->res->body, $original, 'a controller without the declaration is untouched');
+
+	$group->get_ok('/docs/raw')->status_is(200);
+	like($group->tx->res->body, $original, 'a route default of 0 opts one page out');
+
+	$group->get_ok('/docs/override')->status_is(200);
+	like($group->tx->res->body, $original, 'the buffer stash overrides the group');
+};
+
 done_testing();

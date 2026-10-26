@@ -195,6 +195,20 @@ squashing and link rewriting still run, but comments and embedded CSS and
 JavaScript are left alone, as they are by L<CGI::Buffer> and
 L<FCGI::Buffer>.  Install L<HTML::Packer> for the full effect.
 
+Like L</trust_last_modified>, it can be declared once for a group of pages,
+as a route default, an C<under> route or a controller method:
+
+    $r->get('/about' => {optimise_content => 1} => sub {...});
+    my $docs = $r->under('/docs')->to(optimise_content => 1);
+
+    package MyApp::Controller::Docs;
+    use Mojo::Base 'Mojolicious::Controller';
+    has buffer_optimise_content => 1;
+
+A declaration beats the plugin option, a route default of C<0> turns
+optimisation off inside a group that has it on, and the C<buffer> stash
+overrides both.
+
 =head2 rewrite_links
 
 When optimising, rewrite C<E<lt>a hrefE<gt>> and C<E<lt>img srcE<gt>> links that
@@ -315,7 +329,8 @@ A route default wins over the controller declaration, so a route default of
 C<0> opts one page back out of a trusting namespace, and the C<buffer> stash
 overrides both.  The declaration has no effect when L</generate_304> is off,
 and it cannot make a page safe: it only says that the application and its
-templates really are the only inputs.
+templates really are the only inputs.  L</optimise_content> can be declared
+for a group in the same way.
 
 =head2 Last-Modified performance
 
@@ -691,6 +706,14 @@ sub _module_available {
 	return $check->() ? 1 : 0;
 }
 
+# Options that can be declared for a group of pages, either as a route
+# default, which lands in the stash,
+#     $r->get('/about' => {trust_last_modified => 1} => sub {...});
+#     $r->under('/docs')->to(optimise_content => 1);
+# or by the controller itself, which its namespace inherits:
+#     sub buffer_optimise_content { 1 }
+my @GROUP_OPTIONS = qw(optimise_content trust_last_modified);
+
 sub _options_for {
 	my ($c, $state) = @_;
 
@@ -700,29 +723,25 @@ sub _options_for {
 	my $options = $state->{options};
 	$options = {%$options, %$override} if ref($override) eq 'HASH';
 
-	# A route default or a controller class can opt a whole group of pages in,
-	# with the buffer stash still the most specific place to say otherwise
-	unless (ref($override) eq 'HASH' && exists($override->{trust_last_modified})) {
-		my $declared = _trust_last_modified_for($c);
-		$options = {%$options, trust_last_modified => $declared} if defined($declared);
+	# A route default or a controller class can declare these for a whole
+	# group of pages, with the buffer stash still the most specific place to
+	# say otherwise
+	for my $name (@GROUP_OPTIONS) {
+		next if ref($override) eq 'HASH' && exists($override->{$name});
+		my $declared = _declared_option($c, $name);
+		$options = {%$options, $name => $declared} if defined($declared);
 	}
 
 	return ($options, 0);
 }
 
-# L</trust_last_modified> can be declared for a group of pages, either as a
-# route default, which lands in the stash,
-#     $r->get('/about' => {trust_last_modified => 1} => sub {...});
-#     $r->under('/docs')->to(trust_last_modified => 1);
-# or by the controller itself, which its namespace inherits:
-#     sub buffer_trust_last_modified { 1 }
-sub _trust_last_modified_for {
-	my $c = shift;
+sub _declared_option {
+	my ($c, $name) = @_;
 
-	my $stashed = $c->stash->{trust_last_modified};
-	return $stashed ? 1 : 0 if defined($stashed) && !ref($stashed);
+	my $stashed = $c->stash->{$name};
+	return $stashed if defined($stashed) && !ref($stashed);
 
-	my $method = 'buffer_trust_last_modified';
+	my $method = "buffer_$name";
 	return undef unless $c->can($method);
 
 	my $declared = eval { $c->$method };
@@ -735,7 +754,7 @@ sub _trust_last_modified_for {
 	}
 	return undef if !defined($declared) || ref($declared);
 
-	return $declared ? 1 : 0;
+	return $declared;
 }
 
 # Wrap the response pipeline so that a request which was building a cache
@@ -1903,6 +1922,11 @@ rewriting:
 
     MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
     REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+
+A server named by C<MPB_REDIS_URL> must answer, because the variable exists
+for this test.  C<REDIS_SERVER> is usually exported for other programs, so a
+server it names that cannot be reached skips the file rather than failing an
+unrelated checkout.
 
 That includes a three-process check of the crash path: a worker takes the
 lock and is killed, another process stays blocked until the TTL expires,

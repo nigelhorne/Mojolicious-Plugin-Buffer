@@ -35,7 +35,8 @@ Revision history for Mojolicious-Plugin-Buffer
 	that starts it on an ephemeral port and checks a MISS followed by a HIT.
 	Add an optional live Redis integration test, skipped unless
 	MPB_REDIS_URL or REDIS_SERVER is configured, with Redis::Fast accepted as
-	an alternative to Redis.
+	an alternative to Redis, and an unreachable ambient REDIS_SERVER skipping
+	the file rather than failing.
 	Exercise the Redis lock crash path with three processes: a killed
 	holder, a blocked waiter and a takeover once the TTL expires, with the
 	TTL configurable through MPB_REDIS_TTL and generous socket timeouts so
@@ -51,3 +52,5 @@ Revision history for Mojolicious-Plugin-Buffer
 	Let trust_last_modified be declared for a group of pages, as a route
 	default (including an under route) or a controller declaration, so a
 	whole namespace opts in once instead of repeating the stash.
+	Offer the same declaration for optimise_content, so static sections can
+	be optimised as a group.

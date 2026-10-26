@@ -1,41 +1,45 @@
-# NAME
+## Name
 
 Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious responses
 
-# VERSION
+## Version
 
-Version 0.07
+Version 0.001.0
 
-# SYNOPSIS
+## Synopsis
 
-    # Mojolicious::Lite
-    use Mojolicious::Lite;
+```perl
+# Mojolicious::Lite
+use Mojolicious::Lite;
 
-    plugin 'Buffer' => {
-        optimise_content => 1,
-        compress_content => 1,
-    };
+plugin 'Buffer' => {
+    optimise_content => 1,
+    compress_content => 1,
+};
 
-    get '/' => sub {
-        my $c = shift;
-        $c->render(template => 'index');
-    };
+get '/' => sub {
+    my $c = shift;
+    $c->render(template => 'index');
+};
 
-    app->start;
+app->start;
+```
 
 The same plugin in a full Mojolicious application:
 
-    package MyApp;
-    use Mojo::Base 'Mojolicious';
+```perl
+package MyApp;
+use Mojo::Base 'Mojolicious';
 
-    sub startup {
-        my $self = shift;
-        $self->plugin('Buffer', optimise_content => 1);
-        $self->routes->get('/' => sub {
-            my $c = shift;
-            $c->render(template => 'index');
-        });
-    }
+sub startup {
+    my $self = shift;
+    $self->plugin('Buffer', optimise_content => 1);
+    $self->routes->get('/' => sub {
+        my $c = shift;
+        $c->render(template => 'index');
+    });
+}
+```
 
 Compression is negotiated from the `Accept-Encoding` request header, so
 nothing extra is needed in your actions - a client that accepts gzip gets
@@ -45,27 +49,31 @@ A server-side cache is optional and opt-in per action.  Give the plugin any
 object that understands `get()`, `set()` and `remove()`, such as [CHI](https://metacpan.org/pod/CHI),
 and call the helper before doing any work:
 
-    use CHI;
-    plugin 'Buffer' => {cache => CHI->new(driver => 'File')};
+```perl
+use CHI;
+plugin 'Buffer' => {cache => CHI->new(driver => 'File')};
 
-    get '/expensive' => sub {
-        my $c = shift;
-        return if $c->buffer_is_cached;   # the cached response has been sent
-        # ... do the expensive work ...
-        $c->render(template => 'expensive');
-    };
+get '/expensive' => sub {
+    my $c = shift;
+    return if $c->buffer_is_cached;   # the cached response has been sent
+    # ... do the expensive work ...
+    $c->render(template => 'expensive');
+};
+```
 
 To turn the plugin off, or to override its options, for a single response,
 put a `buffer` value in the stash:
 
-    # Don't touch this response at all (e.g. it is already compressed,
-    # or the user is downloading it)
-    $c->stash(buffer => 0);
+```perl
+# Don't touch this response at all (e.g. it is already compressed,
+# or the user is downloading it)
+$c->stash(buffer => 0);
 
-    # Use different options for this response
-    $c->stash(buffer => {compress_content => 0, optimise_content => 0});
+# Use different options for this response
+$c->stash(buffer => {compress_content => 0, optimise_content => 0});
+```
 
-# DESCRIPTION
+## Description
 
 `Mojolicious::Plugin::Buffer` is the Mojolicious equivalent of
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  It buffers the response that your
@@ -77,8 +85,8 @@ site with relative links;
 - compresses the response with whichever of Brotli, Zstandard or gzip
 the client prefers and the server supports;
 - adds `ETag`, `Last-Modified` and `Vary` headers, and answers
-`If-None-Match` conditional requests, or `If-Modified-Since` when no `ETag`
-is generated, with `304 Not Modified`;
+`If-None-Match` conditional requests, or `If-Modified-Since` when no
+`ETag` is generated, with `304 Not Modified`;
 - sets an accurate `Content-Length` after the above changes;
 - optionally stores the finished page in a server-side cache and
 replays it for later requests, so that an action can skip its expensive
@@ -92,19 +100,19 @@ response, after the renderer has put the content into the response and
 before the transaction is resumed.  This means it also sees responses
 that were built with `$c->res->body` rather than `$c->render`.
 
-# OPTIONS
+## Options
 
 All options can be given to `plugin()` and, except where noted, overridden
 per request through the `buffer` stash value.
 
-## compress\_content
+### Compress\_Content
 
 Compress eligible responses, defaults to 1.  Set to 0 to only optimise (and
 remember that the plugin turns off ["compress" in Mojolicious::Renderer](https://metacpan.org/pod/Mojolicious%3A%3ARenderer#compress), so a
 response will then not be compressed at all).  The encodings offered to
 clients are controlled by ["encodings"](#encodings).
 
-## optimise\_content
+### Optimise\_Content
 
 How hard to optimise HTML, defaults to 0 (off):
 
@@ -121,47 +129,63 @@ squashing and link rewriting still run, but comments and embedded CSS and
 JavaScript are left alone, as they are by [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and
 [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  Install [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) for the full effect.
 
-## rewrite\_links
+Like ["trust\_last\_modified"](#trust_last_modified), it can be declared once for a group of pages,
+as a route default, an `under` route or a controller method:
+
+```perl
+$r->get('/about' => {optimise_content => 1} => sub {...});
+my $docs = $r->under('/docs')->to(optimise_content => 1);
+
+package MyApp::Controller::Docs;
+use Mojo::Base 'Mojolicious::Controller';
+has buffer_optimise_content => 1;
+```
+
+A declaration beats the plugin option, a route default of `0` turns
+optimisation off inside a group that has it on, and the `buffer` stash
+overrides both.
+
+### Rewrite\_Links
 
 When optimising, rewrite `<a href>` and `<img src>` links that
 point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
 Defaults to 1.  Has no effect unless ["optimise\_content"](#optimise_content) is enabled.
 
-## generate\_etag
+### Generate\_Etag
 
 Add an `ETag` header to `200` responses to `GET` and `HEAD` requests,
 defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
 representation of the same page have different tags.
 
-## generate\_304
+### Generate\_304
 
 Answer conditional requests with `304 Not Modified` when the
 `If-None-Match` header matches, defaults to 1.  `If-None-Match` takes
 precedence over `If-Modified-Since`, as required by RFC 7232.
 
 `If-Modified-Since` is only used when no `ETag` is generated for the
-response, which means ["generate\_etag"](#generate_etag) is off, unless
-["trust\_last\_modified"](#trust_last_modified) opts back in.  `Last-Modified` is derived
-from the application and its templates, and says nothing about the data a
-page was rendered from: a database row or a stash value can change while the
-template stays untouched.  A 304 on the timestamp alone would tell such a
-client that its stale copy is current, so with an `ETag` available only the
-tag can revalidate the response.  Clients that have the tag, which includes
-browsers after the first `200`, send `If-None-Match` and are unaffected.
+response, which means ["generate\_etag"](#generate_etag) is off, unless ["trust\_last\_modified"](#trust_last_modified)
+opts back in.  `Last-Modified` is derived from the application and its
+templates, and says nothing about the data a page was rendered from: a
+database row or a stash value can change while the template stays untouched.
+A 304 on the timestamp alone would tell such a client that its stale copy is
+current, so with an `ETag` available only the tag can revalidate the
+response.  Clients that have the tag, which includes browsers after the first
+`200`, send `If-None-Match` and are unaffected.
 
-## last\_modified
+### Last\_Modified
 
 Add a `Last-Modified` header, and honour `If-Modified-Since` when no
-`ETag` is generated (see ["generate\_304"](#generate_304)) or
-["trust\_last\_modified"](#trust_last_modified) is set, defaults to 1, which
-uses the newest modification time of the application script (`$0`) and the
-renderer's template files and directories.  May be:
+`ETag` is generated (see ["generate\_304"](#generate_304)) or ["trust\_last\_modified"](#trust_last_modified) is
+set, defaults to 1, which uses the newest modification time of the
+application script (`$0`) and the renderer's template files and directories.
+May be:
 
 - 0 - do not generate the header
-- 1 - use the newest modification time of the application script (`$0`) and
-  the files and directories under the renderer's template paths
+- 1 - use the newest modification time of the application script
+(`$0`) and the files and directories under the renderer's template paths
 - a number - a Unix epoch
 - a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can parse
 - a coderef - called with the controller, returns any of the above
@@ -176,17 +200,16 @@ directories under the renderer's `paths`, so editing a template changes
 and `hypnotoad` set `$0` to your application script, but under a PSGI or
 module-only deployment it may be the wrapper instead; pass an explicit epoch
 or a coderef there.  The template paths are scanned once per request, unless
-["template\_mtime\_cache"](#template_mtime_cache) is configured, so for a large
-tree or an application that does not use templates, an explicit epoch or
-coderef is cheaper.  Database rows and other inputs are not covered; use a
-coderef for pages whose freshness depends on them, or set
-`last_modified => 0` and rely on ["generate\_etag"](#generate_etag) alone.  A
-page whose data changes without its template changing is never answered with
-a 304 from this timestamp while an `ETag` is generated, but the header itself
-still only describes the code, so a client that keeps `If-Modified-Since`
-without the tag will keep refetching it.
+["template\_mtime\_cache"](#template_mtime_cache) is configured, so for a large tree or an application
+that does not use templates, an explicit epoch or coderef is cheaper.
+Database rows and other inputs are not covered; use a coderef for pages whose
+freshness depends on them, or set `last_modified => 0` and rely on
+["generate\_etag"](#generate_etag) alone.  A page whose data changes without its template
+changing is never answered with a 304 from this timestamp while an `ETag` is
+generated, but the header itself still only describes the code, so a client
+that keeps `If-Modified-Since` without the tag will keep refetching it.
 
-## trust\_last\_modified
+### Trust\_Last\_Modified
 
 Answer `If-Modified-Since` even when an `ETag` is generated, defaults to 0.
 Only enable it for pages whose body is a function of the application and its
@@ -201,55 +224,61 @@ revalidated by those clients without a tag.  `If-None-Match` still takes
 precedence, so a client holding the tag is still protected from a stale copy
 even here:
 
-    plugin 'Buffer' => {
-        trust_last_modified => 1,   # this application only renders templates
-    };
+```perl
+plugin 'Buffer' => {
+    trust_last_modified => 1,   # this application only renders templates
+};
+```
 
 Use it per response instead with `$c->stash(buffer => {trust_last_modified
-=> 1})` when only some pages are that predictable.
+&#x3d;> 1})` when only some pages are that predictable.
 
 A whole group of pages can opt in once.  The easiest way is a route default,
 which [Mojolicious](https://metacpan.org/pod/Mojolicious) copies into the stash:
 
-    # one route
-    $r->get('/about' => {trust_last_modified => 1} => sub {...});
+```perl
+# one route
+$r->get('/about' => {trust_last_modified => 1} => sub {...});
 
-    # everything beneath an under route
-    my $docs = $r->under('/docs')->to(trust_last_modified => 1);
-    $docs->get('/intro' => sub {...});
+# everything beneath an under route
+my $docs = $r->under('/docs')->to(trust_last_modified => 1);
+$docs->get('/intro' => sub {...});
+```
 
 A controller can declare it for itself and, through a base class, for its
 whole namespace:
 
-    package MyApp::Controller::Docs;
-    use Mojo::Base 'Mojolicious::Controller';
-    has buffer_trust_last_modified => 1;
+```perl
+package MyApp::Controller::Docs;
+use Mojo::Base 'Mojolicious::Controller';
+has buffer_trust_last_modified => 1;
 
-    sub intro { shift->render(template => 'docs/intro') }
+sub intro { shift->render(template => 'docs/intro') }
+```
 
 A plain `sub buffer_trust_last_modified { 1 }` works too, for a value that
 depends on something the controller knows at request time.
 
 A route default wins over the controller declaration, so a route default of
 `0` opts one page back out of a trusting namespace, and the `buffer` stash
-overrides both.  The declaration has no effect when
-["generate\_304"](#generate_304) is off, and it cannot make a page safe: it
-only says that the application and its templates really are the only inputs.
+overrides both.  The declaration has no effect when ["generate\_304"](#generate_304) is off,
+and it cannot make a page safe: it only says that the application and its
+templates really are the only inputs.  ["optimise\_content"](#optimise_content) can be declared
+for a group in the same way.
 
-## Last-Modified performance
+### Last-Modified Performance
 
 The scan costs one `stat()` per file and directory under the renderer's
 paths.  On a tree of 10,000 templates in 100 directories, a request using the
 default scan took about 40 milliseconds of CPU on the machine used for these
 measurements, against about 1 millisecond for the same request with an
 explicit epoch; that is roughly 4 microseconds per tree entry.  With
-["template\_mtime\_cache"](#template_mtime_cache) in front of it, the same
-request also took about 1 millisecond, the cache lookup adding only a few
-tens of microseconds, so the middle ground gives up roughly 2% of the scan's
-cost to keep template awareness.  The numbers are indicative, not a promise,
-and a faster or slower filesystem will move them.  Run
-[benchmarks/last_modified.pl](benchmarks/last_modified.pl) with your own tree
-size to measure all three variants.
+["template\_mtime\_cache"](#template_mtime_cache) in front of it, the same request also took about 1
+millisecond, the cache lookup adding only a few tens of microseconds, so the
+middle ground gives up roughly 2% of the scan's cost to keep template
+awareness.  The numbers are indicative, not a promise, and a faster or slower
+filesystem will move them.  Run `benchmarks/last_modified.pl` with your own
+tree size to measure all three variants.
 
 Use an explicit epoch or a coderef when template changes do not need to move
 `Last-Modified` and you do not rely on response-cache invalidation after a
@@ -257,7 +286,7 @@ template edit.  Use ["template\_mtime\_cache"](#template_mtime_cache) when you n
 but not a scan on every request: it costs one cache lookup per request and
 bounds how long a template edit can be missed by its duration.
 
-## template\_mtime\_cache
+### Template\_Mtime\_Cache
 
 An optional cache object understanding `get()` and `set()`, such as a
 [CHI](https://metacpan.org/pod/CHI) instance, used to remember the result of the template mtime scan.
@@ -279,9 +308,8 @@ debug level and the scan runs as usual, so a broken cache cannot stop a
 response.
 
 For a large tree this is the middle ground: it avoids the per-request scan
-described under ["Last-Modified performance"](#last-modified-performance)
-while still noticing template changes, at the cost of up to one duration of
-staleness.
+described under ["Last-Modified performance"](#last-modified-performance) while still noticing template
+changes, at the cost of up to one duration of staleness.
 
 The cached value is only refreshed when the entry expires.  A template edit
 therefore is not noticed until then, and neither `Last-Modified` nor the
@@ -291,18 +319,18 @@ Keep ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) short 
 This option and ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) are read when the plugin is
 registered; they cannot be overridden through the `buffer` stash.
 
-## template\_mtime\_cache\_duration
+### Template\_Mtime\_Cache\_Duration
 
 How long a template mtime is kept, defaults to 10 seconds.  It is passed to
 the cache's `set()`, so for [CHI](https://metacpan.org/pod/CHI) it may be a number of seconds or a
 human-readable duration.
 
-## min\_compress\_size
+### Min\_Compress\_Size
 
 Do not compress bodies smaller than this many bytes, defaults to 32.
 Compression is also skipped if it would not make the body smaller.
 
-## encodings
+### Encodings
 
 An arrayref of the content codings to offer, in server preference order.
 Defaults to `[qw(br zstd gzip)]`.  `br` is only offered if
@@ -310,7 +338,7 @@ Defaults to `[qw(br zstd gzip)]`.  `br` is only offered if
 is installed; gzip is always available.  Clients pick with the usual
 quality values, and `identity` is used when nothing acceptable is offered.
 
-## compressible\_types
+### Compressible\_Types
 
 An arrayref of media types to compress, defaults to `text/*`,
 `application/json`, `application/javascript`, `application/xml`,
@@ -318,31 +346,31 @@ An arrayref of media types to compress, defaults to `text/*`,
 Entries may be strings (matched exactly, case-insensitively) or regular
 expressions.
 
-## excluded\_types
+### Excluded\_Types
 
 An arrayref of media types that are never buffered, defaults to
 `text/event-stream`.  Entries may be strings or regular expressions.
 
-## cache
+### Cache
 
 An optional cache object understanding `get()`, `set()` and `remove()`,
 such as a [CHI](https://metacpan.org/pod/CHI) instance.  Defaults to undef, which disables the
 server-side cache.  See ["buffer\_is\_cached"](#buffer_is_cached) for the rules about what is
 cached and how keys are made.
 
-## cache\_duration
+### Cache\_Duration
 
 How long entries are kept in the cache, defaults to `'10 minutes'`.  It is
 passed to the cache's `set()`, so for [CHI](https://metacpan.org/pod/CHI) it may be a number of seconds
 or a human-readable duration.
 
-## cache\_key
+### Cache\_Key
 
 A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
 when the response depends on something the default key does not cover.
 
-## cache\_single\_flight
+### Cache\_Single\_Flight
 
 Only let one request at a time build a missing entry, defaults to 1.  When a
 request misses the cache while another request in the same worker is already
@@ -359,60 +387,61 @@ the waiting request is answered with `503 Service Unavailable` and
 every concurrent miss run the action independently.
 
 By default the in-flight table is per worker process, so with N [hypnotoad](https://metacpan.org/pod/hypnotoad)
-workers a cold entry can still be built up to N times.  Set
-["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to elect a single
-builder across processes instead.
+workers a cold entry can still be built up to N times.  Set ["cache\_lock"](#cache_lock) or
+["cache\_lock\_dir"](#cache_lock_dir) to elect a single builder across processes instead.
 
-## cache\_lock
+### Cache\_Lock
 
 An optional object that elects one process to build a missing entry, for
 workers that cannot share a directory.  It must implement:
 
-- **acquire**
+- acquire
 
-      my ($guard, $error) = $lock->acquire($key);
+    ```perl
+    my ($guard, $error) = $lock->acquire($key);
+    ```
 
-  Return a truthy guard if the lock was acquired, `(undef, undef)` if another
-  process holds it, and `(undef, $error)` if the backend failed.  On an error
-  the plugin logs the message and continues with a per-worker flight, so a
-  cache miss is still built.
+    Return a truthy guard if the lock was acquired, `(undef, undef)` if another
+    process holds it, and `(undef, $error)` if the backend failed.  On an error
+    the plugin logs the message and continues with a per-worker flight, so a
+    cache miss is still built.
 
-  The call is synchronous and runs before the action is allowed to continue.
-  A backend must therefore be quick and must not depend on the event loop; an
-  asynchronous Redis client is not suitable.
+    The call is synchronous and runs before the action is allowed to continue.
+    A backend must therefore be quick and must not depend on the event loop; an
+    asynchronous Redis client is not suitable.
 
-- **release**
+- release
 
-      $lock->release($guard);
+    ```
+    $lock->release($guard);
+    ```
 
-  Release a guard returned by `acquire`.  The guard is opaque to the plugin.
-  Releasing a lock that has already expired is allowed.  If release fails, the
-  lock should expire on its own; the backend can return `(0, $error)` so the
-  failure is logged.
+    Release a guard returned by `acquire`.  The guard is opaque to the plugin.
+    Releasing a lock that has already expired is allowed.  If release fails, the
+    lock should expire on its own; the backend can return `(0, $error)` so the
+    failure is logged.
 
 The cache itself must still be shared between the workers.  The built-in
-backends are [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
-selected with ["cache\_lock\_dir"](#cache_lock_dir), and
-[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis).
-`cache_lock` cannot be combined with ["cache\_lock\_dir"](#cache_lock_dir), and is
-read when the plugin is registered rather than per response.
+backends are [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile), selected with
+["cache\_lock\_dir"](#cache_lock_dir), and [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis).
+`cache_lock` cannot be combined with ["cache\_lock\_dir"](#cache_lock_dir), and is read when
+the plugin is registered rather than per response.
 
-## cache\_lock\_timeout
+### Cache\_Lock\_Timeout
 
 How long a request may wait for another request, in this worker or another
 one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
 long a key is considered to be in flight when the request building it never
 finishes.  Fractional seconds are allowed, so `0.5` is valid.
 
-## cache\_lock\_dir
+### Cache\_Lock\_Dir
 
 A directory in which to keep lock files used to coalesce cache misses across
 worker processes, defaults to undef, which limits single-flight to one worker.
-This selects the built-in
-[Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile)
-backend and is a shorthand for `cache_lock =>
-Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir)`.  The plugin
-creates the directory if necessary.  It cannot be combined with
+This selects the built-in [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile) backend
+and is a shorthand for `cache_lock =>
+Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir)`.  The
+plugin creates the directory if necessary.  It cannot be combined with
 ["cache\_lock"](#cache_lock).
 
 The workers must share this directory and the cache itself.  A per-worker
@@ -425,12 +454,12 @@ tiny and can be deleted while the application is stopped.  Use a private
 directory.
 
 This works for [hypnotoad](https://metacpan.org/pod/hypnotoad) workers on the same host, or on a shared
-filesystem that implements `flock` reliably.  For workers on different hosts,
-use ["cache\_lock"](#cache_lock) with
-[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
-instead.  It is read when the plugin is registered, not per response.
+filesystem that implements `flock` reliably.  For workers on different
+hosts, use ["cache\_lock"](#cache_lock) with
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis) instead.  It is read when the
+plugin is registered, not per response.
 
-## vary\_by
+### Vary\_by
 
 An arrayref of request header names that become part of the generated cache
 key.  Defaults to `['cookie']`, which keeps one client's session from being
@@ -440,25 +469,29 @@ response varies by language.  Headers listed here may also appear in the
 response's `Vary` header; a response that varies on anything else is not
 stored.
 
-# METHODS
+## Methods
 
 `Mojolicious::Plugin::Buffer` inherits all methods from
 [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin) and implements the following new one.  It also adds
 the ["buffer\_is\_cached"](#buffer_is_cached) helper to the application.
 
-## register
+### Register
 
-    $plugin->register(Mojolicious->new, {optimise_content => 1});Register the plugin, usually through C<$app-E<gt>plugin('Buffer', ...)>.
+```perl
+$plugin->register(Mojolicious->new, {optimise_content => 1});Register the plugin, usually through C<$app-E<gt>plugin('Buffer', ...)>.
 Croaks if an unknown option is given or an option has the wrong shape.
+```
 
-## buffer\_is\_cached
+### Buffer\_Is\_Cached
 
-    get '/expensive' => sub {
-        my $c = shift;
-        return if $c->buffer_is_cached;
-        # ... expensive work ...
-        $c->render(template => 'expensive');
-    };
+```perl
+get '/expensive' => sub {
+    my $c = shift;
+    return if $c->buffer_is_cached;
+    # ... expensive work ...
+    $c->render(template => 'expensive');
+};
+```
 
 Look for a cached response and, if there is one, replay its status, headers
 and body, add `X-Cache: HIT`, finish the response and return true.  The
@@ -483,9 +516,9 @@ listed in ["vary\_by"](#vary_by); use ["cache\_key"](#cache_key) to replace it. 
 is significant.
 
 Concurrent misses for the same key are coalesced within a worker, or across
-workers when ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) is set:
-while one request is building an entry, later requests wait for it and replay
-the result instead of running the action again.  The waiting requests are held asynchronously, so this
+workers when ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) is set: while one request
+is building an entry, later requests wait for it and replay the result
+instead of running the action again.  The waiting requests are held asynchronously, so this
 works for actions that themselves use the event loop.  See
 ["cache\_single\_flight"](#cache_single_flight) for the failure and timeout behaviour.
 
@@ -493,161 +526,172 @@ Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
 `$c->stash(buffer => {cache => undef})` before calling it.
 
-# DEPLOYMENT
+## Deployment
 
-## Hypnotoad
+### Hypnotoad
 
-[hypnotoad](https://metacpan.org/pod/hypnotoad) preloads the application
-before forking the workers, so the plugin is registered once and every worker
-inherits the same cache object and lock backend.  The cache storage, and the
-storage used by the lock backend, must be shared and writable by the user that
-runs the workers.  The example below uses [CHI](https://metacpan.org/pod/CHI),
-which must be installed in the application's environment.
+[hypnotoad](https://metacpan.org/pod/hypnotoad) preloads the application before forking the workers, so the
+plugin is registered once and every worker inherits the same cache object
+and lock backend.  The cache storage, and the storage used by the lock
+backend, must be shared and writable by the user that runs the workers.  The
+example below uses [CHI](https://metacpan.org/pod/CHI), which must be installed in the application's
+environment.
 
 A complete application:
 
-    package MyApp;
-    use Mojo::Base 'Mojolicious';
+```perl
+package MyApp;
+use Mojo::Base 'Mojolicious';
 
-    use CHI;
+use CHI;
 
-    sub startup {
-        my $self = shift;
+sub startup {
+    my $self = shift;
 
-        $self->config(hypnotoad => {
-            listen   => ['http://*:8080'],
-            workers  => 4,
-            pid_file => '/var/lib/myapp/hypnotoad.pid',
-        });
+    $self->config(hypnotoad => {
+        listen   => ['http://*:8080'],
+        workers  => 4,
+        pid_file => '/var/lib/myapp/hypnotoad.pid',
+    });
 
-        $self->plugin('Buffer' => {
-            optimise_content => 1,
-            cache => CHI->new(
-                driver    => 'File',
-                root_dir  => '/var/cache/myapp/buffer',
-                namespace => 'pages',
-            ),
-            cache_lock_dir => '/var/lib/myapp/buffer-locks',
-            cache_duration => '10 minutes',
-        });
+    $self->plugin('Buffer' => {
+        optimise_content => 1,
+        cache => CHI->new(
+            driver    => 'File',
+            root_dir  => '/var/cache/myapp/buffer',
+            namespace => 'pages',
+        ),
+        cache_lock_dir => '/var/lib/myapp/buffer-locks',
+        cache_duration => '10 minutes',
+    });
 
-        $self->routes->get('/expensive' => sub {
-            my $c = shift;
-            return if $c->buffer_is_cached;
+    $self->routes->get('/expensive' => sub {
+        my $c = shift;
+        return if $c->buffer_is_cached;
 
-            # ... expensive work ...
+        # ... expensive work ...
 
-            $c->render(template => 'expensive');
-        });
-    }
+        $c->render(template => 'expensive');
+    });
+}
 
-    1;
+1;
+```
 
 A runnable copy of this example, with its paths under `eg/hypnotoad`, is
-included as [eg/hypnotoad](eg/hypnotoad).
+included as `eg/hypnotoad`.
 
 `script/my_app` is the usual launcher:
 
-    #!/usr/bin/env perl
-    use strict;
-    use warnings;
-    use FindBin;
-    use lib "$FindBin::Bin/../lib";
-    use MyApp;
+```perl
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use MyApp;
 
-    MyApp->new->start;
+MyApp->new->start;
+```
 
 Create the directories as the deployment user and start the server:
 
-    install -d -o www-data -g www-data -m 0750 /var/cache/myapp/buffer
-    install -d -o www-data -g www-data -m 0750 /var/lib/myapp /var/lib/myapp/buffer-locks
-    hypnotoad script/my_app
+```
+install -d -o www-data -g www-data -m 0750 /var/cache/myapp/buffer
+install -d -o www-data -g www-data -m 0750 /var/lib/myapp /var/lib/myapp/buffer-locks
+hypnotoad script/my_app
+```
 
-Replace `www-data` with the unprivileged user that runs the workers; do not run
-hypnotoad as root.  The plugin creates [`cache\_lock\_dir`](#cache_lock_dir) if
-necessary, but pre-creating it as the deployment user sets its ownership and
+Replace `www-data` with the unprivileged user that runs the workers; do not
+run hypnotoad as root.  The plugin creates `cache_lock_dir` if necessary,
+but pre-creating it as the deployment user sets its ownership and
 permissions.  The cache directory must be writable by that user too.  Use
 `hypnotoad -f script/my_app` in the foreground while testing, and
 `hypnotoad -s script/my_app` to stop it.
 
-## Cache and lock requirements
+### Cache and Lock Requirements
 
-For workers on the same host, [CHI](https://metacpan.org/pod/CHI)'s `File` driver
-and the built-in file lock backend work.  Do not use `Memory`, and do not put a
-per-worker `L1` cache in front of the shared cache: a waiting worker would not
-see the entry built by another worker and would eventually receive `503
-Service Unavailable`.  A shared filesystem with reliable `flock` can also be
-used on several hosts.
+For workers on the same host, [CHI](https://metacpan.org/pod/CHI)'s `File` driver and the built-in file
+lock backend work.  Do not use `Memory`, and do not put a per-worker `L1`
+cache in front of the shared cache: a waiting worker would not see the entry
+built by another worker and would eventually receive `503 Service
+Unavailable`.  A shared filesystem with reliable `flock` can also be used
+on several hosts.
 
-## Multiple hosts
+### Multiple Hosts
 
-Workers on different hosts need a shared cache and a lock backend that does not
-rely on `flock`.  This example uses CHI's Memcached driver for the cache and
-[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
-for the lock, with the [Redis](https://metacpan.org/pod/Redis) client:
+Workers on different hosts need a shared cache and a lock backend that does
+not rely on `flock`.  This example uses CHI's Memcached driver for the cache
+and [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis) for the lock, with the
+[Redis](https://metacpan.org/pod/Redis) client:
 
-    use CHI;
-    use Mojolicious::Plugin::Buffer::Lock::Redis;
-    use Redis;
+```perl
+use CHI;
+use Mojolicious::Plugin::Buffer::Lock::Redis;
+use Redis;
 
-    my $redis = sub {
-        Redis->new(
-            server        => 'redis://redis.internal:6379',
-            cnx_timeout   => 1,
-            read_timeout  => 1,
-            write_timeout => 1,
-        );
-    };
+my $redis = sub {
+    Redis->new(
+        server        => 'redis://redis.internal:6379',
+        cnx_timeout   => 1,
+        read_timeout  => 1,
+        write_timeout => 1,
+    );
+};
 
-    $app->plugin('Buffer' => {
-        cache => CHI->new(
-            driver    => 'Memcached',
-            servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
-            namespace => 'pages',
-        ),
-        cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
-            redis     => $redis,
-            namespace => 'myapp:buffer:',
-            ttl       => 60,
-        ),
-        cache_duration => '10 minutes',
-    });
+$app->plugin('Buffer' => {
+    cache => CHI->new(
+        driver    => 'Memcached',
+        servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
+        namespace => 'pages',
+    ),
+    cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
+        redis     => $redis,
+        namespace => 'myapp:buffer:',
+        ttl       => 60,
+    ),
+    cache_duration => '10 minutes',
+});
+```
 
-The `ttl` must be longer than ["cache\_lock\_timeout"](#cache_lock_timeout) and
-longer than the slowest cached action.  If it expires while the builder is
-still working, another worker can start building the same entry.  The Redis
-client is called synchronously, so set short connect, read and write timeouts.
-The code reference is called once per worker, after the fork; a connection
+The `ttl` must be longer than ["cache\_lock\_timeout"](#cache_lock_timeout) and longer than the
+slowest cached action.  If it expires while the builder is still working,
+another worker can start building the same entry.  The Redis client is
+called synchronously, so set short connect, read and write timeouts.  The
+code reference is called once per worker, after the fork; a connection
 created in `startup` would be shared by every worker and must not be used.
-CHI's Memcached driver needs
-[Cache::Memcached::Fast](https://metacpan.org/pod/Cache%3A%3AMemcached%3A%3AFast).
+CHI's Memcached driver needs [Cache::Memcached::Fast](https://metacpan.org/pod/Cache%3A%3AMemcached%3A%3AFast).
 
 Only cache pages that are identical for every visitor.  The default key
-includes the `Cookie` header, not the contents of the session, so a page that
-depends on the session needs ["cache\_key"](#cache_key) or a suitable
-["vary\_by"](#vary_by) list.  Entries are discarded when the application
-script or a template changes, and otherwise expire after
-["cache\_duration"](#cache_duration).
+includes the `Cookie` header, not the contents of the session, so a page
+that depends on the session needs ["cache\_key"](#cache_key) or a suitable ["vary\_by"](#vary_by)
+list.  Entries are discarded when the application script or a template
+changes, and otherwise expire after ["cache\_duration"](#cache_duration).
 
-# NOTES
+## Notes
 
-## Testing
+### Testing
 
 The Redis lock backend has an optional live integration test.  It skips when
-`MPB_REDIS_URL` (or `REDIS_SERVER`) is not set, or when neither the
-[Redis](https://metacpan.org/pod/Redis) nor [Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) client is installed.
-Redis::Fast is used when it is the only client available.  The test has been
-run against a live server with each client, once with
-[Redis](https://metacpan.org/pod/Redis) and once with only
-[Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) available ([Redis](https://metacpan.org/pod/Redis) hidden with
-[Test::Without::Module](https://metacpan.org/pod/Test%3A%3AWithout%3A%3AModule)), and both runs include the three-process
+`MPB_REDIS_URL` (or `REDIS_SERVER`) is not set, or when neither [Redis](https://metacpan.org/pod/Redis) nor
+[Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) is installed.  Redis::Fast is used when it is the only client
+available.  The test has been run against a live server with each client,
+once with [Redis](https://metacpan.org/pod/Redis) and once with only [Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) available ([Redis](https://metacpan.org/pod/Redis)
+hidden with [Test::Without::Module](https://metacpan.org/pod/Test%3A%3AWithout%3A%3AModule)), and both runs include the three-process
 crash check described below.  When either variable is set, the test expects
 that server to be reachable; the value may be a `redis://` URL or a bare
-`host:port`, so a `REDIS_SERVER` already in the environment needs no
+`host:port`, so `REDIS_SERVER` already in the environment needs no
 rewriting:
 
-    MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
-    REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+```
+MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+```
+
+A server named by `MPB_REDIS_URL` must answer, because the variable exists
+for this test.  `REDIS_SERVER` is usually exported for other programs, so a
+server it names that cannot be reached skips the file rather than failing an
+unrelated checkout.
 
 That includes a three-process check of the crash path: a worker takes the
 lock and is killed, another process stays blocked until the TTL expires,
@@ -657,7 +701,7 @@ run out rather than sleeping a fixed margin; set `MPB_REDIS_TTL` to widen
 that further on a heavily loaded machine.  The normal test suite does not
 require a Redis server.
 
-## Why a plugin?
+### Why a Plugin?
 
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) replaces `STDOUT` with an in-memory buffer and does its work
 in an `END` block, and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer) buffers each FastCGI request and does
@@ -667,7 +711,7 @@ hook `after_dispatch` and rewrite it.  That gives the same effect without a
 source filter, without reading `$_`, and without depending on a specific
 server or environment.
 
-## Interaction with the renderer
+### Interaction With the Renderer
 
 `Mojolicious::Renderer` compresses rendered output with gzip by default
 (`compress` is on and `min_compress_size` is 860 bytes).  That happens
@@ -679,14 +723,14 @@ instead - with gzip, Brotli or Zstandard as negotiated, and with the header
 work the renderer does not do.  If you enable `$app->renderer->compress`
 after loading the plugin, those responses will be skipped by the plugin.
 
-## What is not implemented
+### What Is Not Implemented
 
 `save_to`, which rewrites dynamic pages into static ones, is a site
 generation feature rather than a response filter and is not part of this
 plugin.  The server-side cache is available as the opt-in
 ["buffer\_is\_cached"](#buffer_is_cached) helper described above.
 
-# CAVEATS
+## Caveats
 
 - Only in-memory responses are processed.  Static files
 (`Mojo::Asset::File`) and streaming responses are left alone.
@@ -713,26 +757,26 @@ analytics cookie on every visit will get little sharing; use
 `vary_by => []` for genuinely public pages, or ["cache\_key"](#cache_key).
 - Single-flight is per worker by default.  Each `hypnotoad` worker
 keeps its own in-flight table, so a cold entry can be built once per worker;
-set ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to coalesce
-across workers, with a shared cache.  A request waiting on an in-flight
-response is answered with `503` if that
+set ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to coalesce across workers, with a
+shared cache.  A request waiting on an in-flight response is answered with
+`503` if that
 response fails, cannot be cached, or exceeds ["cache\_lock\_timeout"](#cache_lock_timeout), rather
 than running the action a second time.
 - Entries are invalidated when the application script or a template
 path changes, but not when data or configuration changes.  The TTL is the
 backstop for those.
 
-# SEE ALSO
+## See Also
 
-[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker), [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin),
-[Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
+[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker),
+[Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin), [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
 [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
 
-# AUTHOR
+## Author
 
 Nigel Horne, `<njh at bandsman.co.uk>`
 
-# LICENSE AND COPYRIGHT
+## License and Copyright
 
 Copyright 2026 Nigel Horne.
 

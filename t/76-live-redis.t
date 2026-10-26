@@ -17,9 +17,26 @@ use Mojolicious::Plugin::Buffer::Lock::Redis;
 # Either a URL or a bare host:port is understood.  Either Redis or Redis::Fast
 # can drive the client side.  MPB_REDIS_TTL raises the lock TTL used by the
 # crash test on a heavily loaded machine.
-my $url = $ENV{MPB_REDIS_URL} // $ENV{REDIS_SERVER};
+#
+# MPB_REDIS_URL names a server for this test, so a server that cannot be
+# reached is a failure.  REDIS_SERVER is usually exported for other reasons,
+# so an unreachable one skips the file instead of turning an unrelated
+# checkout red.
+my ($url, $source);
+for my $name (qw(MPB_REDIS_URL REDIS_SERVER)) {
+	next unless defined($ENV{$name}) && length($ENV{$name});
+	($url, $source) = ($ENV{$name}, $name);
+	last;
+}
 plan skip_all => 'set MPB_REDIS_URL or REDIS_SERVER to a running Redis server'
-	unless defined($url) && length($url);
+	unless defined($url);
+
+sub skip_or_die {
+	my $message = shift;
+
+	plan skip_all => "$message (from $source)" if $source eq 'REDIS_SERVER';
+	die "$message\n";
+}
 
 my $client_class;
 for my $module (qw(Redis Redis::Fast)) {
@@ -54,10 +71,16 @@ sub new_client {
 }
 
 my $redis = eval { new_client() };
-die "Cannot create a $client_class client for $url: $@" if $@;
+if (my $error = $@) {
+	chomp($error);
+	skip_or_die("Cannot create a $client_class client for $url: $error");
+}
 
 my $pong = eval { $redis->ping };
-die "Cannot reach Redis at $url: $@" if $@;
+if (my $error = $@) {
+	chomp($error);
+	skip_or_die("Cannot reach Redis at $url: $error");
+}
 is($pong, 'PONG', 'the live Redis server is reachable');
 
 my $namespace = 'mpb:live:' . $$ . ':' . int(rand(1_000_000)) . ':';
