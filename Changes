@@ -1,15 +1,4 @@
 Revision history for Mojolicious-Plugin-Buffer
 
-0.02	Mon Oct 26 2026
-	Added an optional CHI-backed server-side response cache, used
-	through the buffer_is_cached helper, so an action can skip its
-	expensive work when a page is already cached.
-	Cache keys can be varied by request headers or replaced with a
-	custom string or coderef, and entries are invalidated when the
-	application script changes.
-
-0.01	Mon Oct 26 2026
+0.001.0
 	Initial version.
-	HTML optimisation, gzip/brotli/zstd compression, ETag and
-	Last-Modified generation, 304 handling, and per-request overrides
-	for Mojolicious responses.
