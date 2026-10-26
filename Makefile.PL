@@ -6,6 +6,7 @@ my %prereq_pm = (
 	'Carp' => 0,
 	'Encode' => 0,
 	'Mojolicious' => '9.00',
+	'version' => 0,
 );
 
 my $dist = {

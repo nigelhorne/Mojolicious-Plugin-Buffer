@@ -14,7 +14,7 @@ use Mojo::Util qw(gzip md5_sum);
 use Scalar::Util qw(blessed refaddr);
 use Time::HiRes ();
 
-our $VERSION = '0.07';
+use version; our $VERSION = version->declare('0.001.0');
 
 # Server preference order for content codings
 my @DEFAULT_ENCODINGS = qw(br zstd gzip);
@@ -60,7 +60,7 @@ Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious respon
 
 =head1 VERSION
 
-Version 0.07
+Version 0.001.0
 
 =cut
 
@@ -1500,6 +1500,94 @@ sub _matches {
 }
 
 1;	# End of Mojolicious::Plugin::Buffer
+
+=head1 DEPLOYMENT
+
+=head2 Hypnotoad
+
+L<hypnotoad> preloads the application before forking the workers, so the
+plugin is registered once and every worker inherits the same cache object
+and lock directory.  The cache storage and the lock directory must be
+shared and writable by the user that runs the workers.  The example below
+uses L<CHI>, which must be installed in the application's environment.
+
+A complete application:
+
+    package MyApp;
+    use Mojo::Base 'Mojolicious';
+
+    use CHI;
+
+    sub startup {
+        my $self = shift;
+
+        $self->config(hypnotoad => {
+            listen   => ['http://*:8080'],
+            workers  => 4,
+            pid_file => '/var/lib/myapp/hypnotoad.pid',
+        });
+
+        $self->plugin('Buffer' => {
+            optimise_content => 1,
+            cache => CHI->new(
+                driver    => 'File',
+                root_dir  => '/var/cache/myapp/buffer',
+                namespace => 'pages',
+            ),
+            cache_lock_dir => '/var/lib/myapp/buffer-locks',
+            cache_duration => '10 minutes',
+        });
+
+        $self->routes->get('/expensive' => sub {
+            my $c = shift;
+            return if $c->buffer_is_cached;
+
+            # ... expensive work ...
+
+            $c->render(template => 'expensive');
+        });
+    }
+
+    1;
+
+C<script/my_app> is the usual launcher:
+
+    #!/usr/bin/env perl
+    use strict;
+    use warnings;
+    use FindBin;
+    use lib "$FindBin::Bin/../lib";
+    use MyApp;
+
+    MyApp->new->start;
+
+Create the directories as the deployment user and start the server:
+
+    install -d -o www-data -g www-data -m 0750 /var/cache/myapp/buffer
+    install -d -o www-data -g www-data -m 0750 /var/lib/myapp /var/lib/myapp/buffer-locks
+    hypnotoad script/my_app
+
+Replace C<www-data> with the unprivileged user that runs the workers; do not
+run hypnotoad as root.  The plugin creates C<cache_lock_dir> if necessary,
+but pre-creating it as the deployment user sets its ownership and
+permissions.  The cache directory must be writable by that user too.  Use
+C<hypnotoad -f script/my_app> in the foreground while testing, and
+C<hypnotoad -s script/my_app> to stop it.
+
+=head2 Cache and lock requirements
+
+L<CHI>'s C<File> driver works for workers on the same host.  Do not use
+C<Memory>, and do not put a per-worker C<L1> cache in front of the shared
+cache: a waiting worker would not see the entry built by another worker and
+would eventually receive C<503 Service Unavailable>.  Workers on different
+hosts need a cache and lock directory on a shared filesystem that implements
+C<flock> reliably.
+
+Only cache pages that are identical for every visitor.  The default key
+includes the C<Cookie> header, not the contents of the session, so a page
+that depends on the session needs L</cache_key> or a suitable L</vary_by>
+list.  Entries are discarded when the application script or a template
+changes, and otherwise expire after L</cache_duration>.
 
 =head1 NOTES
 

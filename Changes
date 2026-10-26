@@ -1,34 +1,4 @@
 Revision history for Mojolicious-Plugin-Buffer
 
-0.07
-	The default last_modified now uses the newest mtime of the application
-	script and the renderer's template files and directories.  Editing a
-	template therefore changes Last-Modified and invalidates cache entries
-	built before the edit, instead of leaving clients with a stale 304.
-
-0.06
-	Add cache_lock_dir, a flock-based shared lock backend, so single-flight
-	coalesces cache misses across hypnotoad workers, not just within one.
-	Run the suite with all recommended modules hidden by
-	Test::Without::Module, and make optional-module detection ignore an
-	ambient $SIG{__DIE__} handler that would otherwise defeat it.
-
-0.05
-	Generate Last-Modified by default from the application script's mtime.
-	Honour If-Modified-Since when no ETag is generated, while If-None-Match
-	still takes precedence.
-
-0.04
-	HTML::Packer is now optional: without it optimise_content still applies
-	the white-space squashing and link rewriting.
-
-0.03
-	Add single-flight coalescing of concurrent cache misses, with the
-	cache_single_flight and cache_lock_timeout options.
-
-0.02
-	Add the optional CHI-backed server-side cache and the buffer_is_cached
-	helper.
-
 0.001.0
 	Initial version.

@@ -326,6 +326,96 @@ Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
 `$c->stash(buffer => {cache => undef})` before calling it.
 
+# DEPLOYMENT
+
+## Hypnotoad
+
+[hypnotoad](https://metacpan.org/pod/hypnotoad) preloads the application
+before forking the workers, so the plugin is registered once and every worker
+inherits the same cache object and lock directory.  The cache storage and the
+lock directory must be shared and writable by the user that runs the workers.
+The example below uses [CHI](https://metacpan.org/pod/CHI), which must be
+installed in the application's environment.
+
+A complete application:
+
+    package MyApp;
+    use Mojo::Base 'Mojolicious';
+
+    use CHI;
+
+    sub startup {
+        my $self = shift;
+
+        $self->config(hypnotoad => {
+            listen   => ['http://*:8080'],
+            workers  => 4,
+            pid_file => '/var/lib/myapp/hypnotoad.pid',
+        });
+
+        $self->plugin('Buffer' => {
+            optimise_content => 1,
+            cache => CHI->new(
+                driver    => 'File',
+                root_dir  => '/var/cache/myapp/buffer',
+                namespace => 'pages',
+            ),
+            cache_lock_dir => '/var/lib/myapp/buffer-locks',
+            cache_duration => '10 minutes',
+        });
+
+        $self->routes->get('/expensive' => sub {
+            my $c = shift;
+            return if $c->buffer_is_cached;
+
+            # ... expensive work ...
+
+            $c->render(template => 'expensive');
+        });
+    }
+
+    1;
+
+`script/my_app` is the usual launcher:
+
+    #!/usr/bin/env perl
+    use strict;
+    use warnings;
+    use FindBin;
+    use lib "$FindBin::Bin/../lib";
+    use MyApp;
+
+    MyApp->new->start;
+
+Create the directories as the deployment user and start the server:
+
+    install -d -o www-data -g www-data -m 0750 /var/cache/myapp/buffer
+    install -d -o www-data -g www-data -m 0750 /var/lib/myapp /var/lib/myapp/buffer-locks
+    hypnotoad script/my_app
+
+Replace `www-data` with the unprivileged user that runs the workers; do not run
+hypnotoad as root.  The plugin creates [`cache\_lock\_dir`](#cache_lock_dir) if
+necessary, but pre-creating it as the deployment user sets its ownership and
+permissions.  The cache directory must be writable by that user too.  Use
+`hypnotoad -f script/my_app` in the foreground while testing, and
+`hypnotoad -s script/my_app` to stop it.
+
+## Cache and lock requirements
+
+[CHI](https://metacpan.org/pod/CHI)'s `File` driver works for workers on the
+same host.  Do not use `Memory`, and do not put a per-worker `L1` cache in
+front of the shared cache: a waiting worker would not see the entry built by
+another worker and would eventually receive `503 Service Unavailable`.  Workers
+on different hosts need a cache and lock directory on a shared filesystem that
+implements `flock` reliably.
+
+Only cache pages that are identical for every visitor.  The default key
+includes the `Cookie` header, not the contents of the session, so a page that
+depends on the session needs ["cache\_key"](#cache_key) or a suitable
+["vary\_by"](#vary_by) list.  Entries are discarded when the application
+script or a template changes, and otherwise expire after
+["cache\_duration"](#cache_duration).
+
 # NOTES
 
 ## Why a plugin?

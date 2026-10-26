@@ -16,4 +16,5 @@ t/40-options.t
 t/50-cache.t
 t/60-single-flight.t
 t/70-shared-lock.t
+t/80-hypnotoad.t
 t/90-without-recommended.t
