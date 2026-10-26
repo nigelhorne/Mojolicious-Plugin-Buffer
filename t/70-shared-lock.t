@@ -2,7 +2,9 @@ use strict;
 use warnings;
 
 use Test::More;
+use File::Spec ();
 use File::Temp ();
+use IO::Handle ();
 use Mojo::IOLoop;
 use Mojo::Util ();
 use Mojolicious;
@@ -12,14 +14,25 @@ use Time::HiRes ();
 use Test::Mojo;
 
 use Mojolicious::Plugin::Buffer;
+use Mojolicious::Plugin::Buffer::Lock::File;
 
 {
 	package TestCache;
 
-	sub new { bless {data => {}, sets => 0}, shift }
+	sub new { bless {data => {}, sets => 0, gets => 0, joined => undef}, shift }
 
 	sub get {
 		my ($self, $key) = @_;
+
+		# Tell another process that this one is polling for the entry, so it
+		# does not have to guess when to release the lock
+		my $joined = $self->{joined};
+		if ((++$self->{gets} >= 2) && defined($joined) && !-e $joined) {
+			if (open(my $fh, '>', $joined)) {
+				close($fh);
+			}
+		}
+
 		return $self->{data}{$key};
 	}
 
@@ -42,8 +55,8 @@ use Mojolicious::Plugin::Buffer;
 	package TestFileCache;
 
 	sub new {
-		my ($class, $dir) = @_;
-		return bless {dir => $dir}, $class;
+		my ($class, $dir, $joined) = @_;
+		return bless {dir => $dir, joined => $joined, gets => 0}, $class;
 	}
 
 	sub _path {
@@ -53,6 +66,16 @@ use Mojolicious::Plugin::Buffer;
 
 	sub get {
 		my ($self, $key) = @_;
+
+		# Signal a cooperating process that this one is now polling for the
+		# entry, i.e. that it has missed and joined the shared lock
+		my $joined = $self->{joined};
+		if ((++$self->{gets} >= 2) && defined($joined) && !-e $joined) {
+			if (open(my $fh, '>', $joined)) {
+				close($fh);
+			}
+		}
+
 		my $path = $self->_path($key);
 		return undef unless -f $path;
 		return eval { Storable::retrieve($path) };
@@ -77,6 +100,7 @@ use Mojolicious::Plugin::Buffer;
 
 my $lock_temp = File::Temp->newdir('mpb-locks-XXXXXX', TMPDIR => 1);
 my $lock_dir  = "$lock_temp";
+my $file_lock = Mojolicious::Plugin::Buffer::Lock::File->new(dir => $lock_dir);
 
 sub build_app {
 	my (%options) = @_;
@@ -98,19 +122,19 @@ sub build_app {
 }
 
 subtest 'the file lock is exclusive and released' => sub {
-	my ($first, $error) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'unit-key');
+	my ($first, $error) = $file_lock->acquire('unit-key');
 	ok($first, 'the first lock is acquired');
 	ok(!defined($error), 'no error for the first lock');
 
-	my ($second, $second_error) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'unit-key');
+	my ($second, $second_error) = $file_lock->acquire('unit-key');
 	ok(!$second, 'a second lock is blocked');
 	ok(!defined($second_error), 'a held lock is not reported as an error');
 
-	Mojolicious::Plugin::Buffer::_release_lock($first);
-	my ($third, $third_error) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'unit-key');
+	$file_lock->release($first);
+	my ($third, $third_error) = $file_lock->acquire('unit-key');
 	ok($third, 'the lock can be acquired after release');
 	ok(!defined($third_error), 'no error after release');
-	Mojolicious::Plugin::Buffer::_release_lock($third);
+	$file_lock->release($third);
 };
 
 subtest 'a waiter picks up an entry from another worker' => sub {
@@ -121,26 +145,34 @@ subtest 'a waiter picks up an entry from another worker' => sub {
 		cache_lock_timeout => 2,
 	));
 
-	my ($guard) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
+	my ($guard) = $file_lock->acquire('shared-key');
 	ok($guard, 'another worker holds the lock');
 
-	Mojo::IOLoop->timer(0.3 => sub {
+	# Release only once the request has started polling, so the wait path is
+	# exercised rather than a pre-filled entry being replayed by the first
+	# lookup.  The first cache read is the initial lookup, the second is the
+	# request's first poll of the shared lock.
+	my $release_timer;
+	$release_timer = Mojo::IOLoop->recurring(0.05 => sub {
+		return unless $cache->{gets} >= 2;
+		Mojo::IOLoop->remove($release_timer);
 		$cache->set('shared-key', {
 			body => 'from another worker',
 			status => 200,
 			created => time,
 			headers => [['Content-Type', 'text/html;charset=UTF-8']],
 		}, '1 minute');
-		Mojolicious::Plugin::Buffer::_release_lock($guard);
+		$file_lock->release($guard);
 	});
 
 	$t->get_ok('/shared')->status_is(200)->header_is('X-Cache' => 'HIT');
+	Mojo::IOLoop->remove($release_timer) if $release_timer;
 	is($t->tx->res->body, 'from another worker', 'the waiting request got the other worker\'s entry');
 	is($t->app->{runs}, 0, 'the local action did not run');
 
-	my ($free) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
+	my ($free) = $file_lock->acquire('shared-key');
 	ok($free, 'the lock is free after the wait');
-	Mojolicious::Plugin::Buffer::_release_lock($free);
+	$file_lock->release($free);
 };
 
 subtest 'a waiter gives up when the other worker releases without caching' => sub {
@@ -151,12 +183,22 @@ subtest 'a waiter gives up when the other worker releases without caching' => su
 		cache_lock_timeout => 2,
 	));
 
-	my ($guard) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
+	my ($guard) = $file_lock->acquire('shared-key');
 	ok($guard, 'another worker holds the lock');
-	Mojo::IOLoop->timer(0.3 => sub { Mojolicious::Plugin::Buffer::_release_lock($guard) });
+
+	# Do not race the request's dispatch against a fixed timer.  The first
+	# cache read happens before the waiter joins the shared lock; the second
+	# is its first poll, so wait for that before releasing the lock.
+	my $release_timer;
+	$release_timer = Mojo::IOLoop->recurring(0.05 => sub {
+		return unless $cache->{gets} >= 2;
+		Mojo::IOLoop->remove($release_timer);
+		$file_lock->release($guard);
+	});
 
 	my $started = Time::HiRes::time();
 	$t->get_ok('/shared')->status_is(503)->header_is('Retry-After' => 1);
+	Mojo::IOLoop->remove($release_timer) if $release_timer;
 	my $elapsed = Time::HiRes::time() - $started;
 	cmp_ok($elapsed, '<', 1.5, 'the waiter gave up after the lock was released');
 	is($t->app->{runs}, 0, 'the local action did not run');
@@ -171,7 +213,7 @@ subtest 'a waiter times out while another worker holds the lock' => sub {
 		cache_lock_timeout => 0.3,
 	));
 
-	my ($guard) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
+	my ($guard) = $file_lock->acquire('shared-key');
 	ok($guard, 'another worker holds the lock');
 
 	my $started = Time::HiRes::time();
@@ -180,7 +222,7 @@ subtest 'a waiter times out while another worker holds the lock' => sub {
 	cmp_ok($elapsed, '<', 1.5, 'the waiter timed out');
 	is($t->app->{runs}, 0, 'the local action did not run');
 
-	Mojolicious::Plugin::Buffer::_release_lock($guard);
+	$file_lock->release($guard);
 };
 
 subtest 'the lock is released after a normal request' => sub {
@@ -194,9 +236,9 @@ subtest 'the lock is released after a normal request' => sub {
 	$t->get_ok('/shared')->status_is(200)->header_is('X-Cache' => 'MISS');
 	is($t->app->{runs}, 1, 'the local action built the entry');
 
-	my ($free) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
+	my ($free) = $file_lock->acquire('shared-key');
 	ok($free, 'the lock was released');
-	Mojolicious::Plugin::Buffer::_release_lock($free);
+	$file_lock->release($free);
 
 	$t->get_ok('/shared')->status_is(200)->header_is('X-Cache' => 'HIT');
 	is($t->app->{runs}, 1, 'the second request hit the cache');
@@ -208,7 +250,11 @@ subtest 'a waiter picks up an entry written by another process' => sub {
 	my $dir = File::Temp->newdir('mpb-xproc-XXXXXX', TMPDIR => 1);
 	my $cache_dir = "$dir/cache";
 	mkdir($cache_dir) or die "mkdir $cache_dir: $!";
-	my $cache = TestFileCache->new($cache_dir);
+
+	# The child writes this file once the parent's request is polling, so the
+	# release is ordered after the wait rather than racing a fixed sleep
+	my $joined = File::Spec->catfile("$dir", 'joined.marker');
+	my $cache  = TestFileCache->new($cache_dir, $joined);
 
 	pipe(my $reader, my $writer) or die "pipe: $!";
 	my $pid = fork;
@@ -216,22 +262,29 @@ subtest 'a waiter picks up an entry written by another process' => sub {
 
 	if (!$pid) {
 		close($reader);
-		my ($lock) = Mojolicious::Plugin::Buffer::_acquire_lock($lock_dir, 'shared-key');
-		print {$writer} ($lock ? "locked\n" : "failed\n");
-		if (!$lock) {
+
+		# The parent must see this line before it sends the request, so do
+		# not leave it in the pipe buffer while waiting for the marker
+		$writer->autoflush(1);
+
+		my ($guard) = $file_lock->acquire('shared-key');
+		print {$writer} ($guard ? "locked\n" : "failed\n");
+		if (!$guard) {
 			close($writer);
 			POSIX::_exit(1);
 		}
 
-		# Give the other worker time to start waiting, then fill the entry
-		select(undef, undef, undef, 0.4);
+		# Fill the entry only once the other process has joined the wait, never
+		# before its first cache read, so the wait path is really exercised
+		my $deadline = time + 5;
+		select(undef, undef, undef, 0.01) while (!-e $joined && (time < $deadline));
 		$cache->set('shared-key', {
 			body => 'from another process',
 			status => 200,
 			created => time,
 			headers => [['Content-Type', 'text/html;charset=UTF-8']],
 		}, '1 minute');
-		Mojolicious::Plugin::Buffer::_release_lock($lock);
+		$file_lock->release($guard);
 		print {$writer} "done\n";
 		close($writer);
 		POSIX::_exit(0);

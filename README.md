@@ -165,11 +165,69 @@ directories under the renderer's `paths`, so editing a template changes
 `Last-Modified` and discards cache entries built from the old one.  `morbo`
 and `hypnotoad` set `$0` to your application script, but under a PSGI or
 module-only deployment it may be the wrapper instead; pass an explicit epoch
-or a coderef there.  The template paths are scanned once per request, so for
-a large tree or an application that does not use templates, an explicit
-epoch or coderef is cheaper.  Database rows and other inputs are not
-covered; use a coderef for pages whose freshness depends on them, or set
+or a coderef there.  The template paths are scanned once per request, unless
+["template\_mtime\_cache"](#template_mtime_cache) is configured, so for a large
+tree or an application that does not use templates, an explicit epoch or
+coderef is cheaper.  Database rows and other inputs are not covered; use a
+coderef for pages whose freshness depends on them, or set
 `last_modified => 0` and rely on ["generate\_etag"](#generate_etag) alone.
+
+## Last-Modified performance
+
+The scan costs one `stat()` per file and directory under the renderer's
+paths.  On a tree of 10,000 templates in 100 directories, a request using the
+default scan took about 40 milliseconds of CPU on the machine used for these
+measurements, against about 1 millisecond for the same request with an
+explicit epoch; that is roughly 4 microseconds per tree entry.  The numbers
+are indicative, not a promise, and a faster or slower filesystem will move
+them.  Run [benchmarks/last_modified.pl](benchmarks/last_modified.pl) with
+your own tree size to measure it.
+
+Use an explicit epoch or a coderef when template changes do not need to move
+`Last-Modified` and you do not rely on response-cache invalidation after a
+template edit.  Use ["template\_mtime\_cache"](#template_mtime_cache) when you need template awareness
+but not a scan on every request: it costs one cache lookup per request and
+bounds how long a template edit can be missed by its duration.
+
+## template\_mtime\_cache
+
+An optional cache object understanding `get()` and `set()`, such as a
+[CHI](https://metacpan.org/pod/CHI) instance, used to remember the result of the template mtime scan.
+Defaults to undef, which scans the renderer's template paths on every
+request.  A per-worker cache avoids the scan without sharing anything:
+
+```perl
+use CHI;
+plugin 'Buffer' => {
+    template_mtime_cache => CHI->new(driver => 'Memory', datastore => {}),
+};
+```
+
+A shared cache, such as CHI's File or Memcached driver, also avoids the scan
+for every worker.  Entries are keyed by the application class, the
+application script and its mtime, and the renderer's template paths, and are
+stored with ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration).  A cache failure is logged at
+debug level and the scan runs as usual, so a broken cache cannot stop a
+response.
+
+For a large tree this is the middle ground: it avoids the per-request scan
+described under ["Last-Modified performance"](#last-modified-performance)
+while still noticing template changes, at the cost of up to one duration of
+staleness.
+
+The cached value is only refreshed when the entry expires.  A template edit
+therefore is not noticed until then, and neither `Last-Modified` nor the
+cache invalidation described under ["last\_modified"](#last_modified) sees it immediately.
+Keep ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) short if templates change often.
+
+This option and ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) are read when the plugin is
+registered; they cannot be overridden through the `buffer` stash.
+
+## template\_mtime\_cache\_duration
+
+How long a template mtime is kept, defaults to 10 seconds.  It is passed to
+the cache's `set()`, so for [CHI](https://metacpan.org/pod/CHI) it may be a number of seconds or a
+human-readable duration.
 
 ## min\_compress\_size
 
@@ -234,8 +292,42 @@ every concurrent miss run the action independently.
 
 By default the in-flight table is per worker process, so with N [hypnotoad](https://metacpan.org/pod/hypnotoad)
 workers a cold entry can still be built up to N times.  Set
-["cache\_lock\_dir"](#cache_lock_dir) to a directory shared by the workers and they will elect a
-single builder across processes instead.
+["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to elect a single
+builder across processes instead.
+
+## cache\_lock
+
+An optional object that elects one process to build a missing entry, for
+workers that cannot share a directory.  It must implement:
+
+- **acquire**
+
+      my ($guard, $error) = $lock->acquire($key);
+
+  Return a truthy guard if the lock was acquired, `(undef, undef)` if another
+  process holds it, and `(undef, $error)` if the backend failed.  On an error
+  the plugin logs the message and continues with a per-worker flight, so a
+  cache miss is still built.
+
+  The call is synchronous and runs before the action is allowed to continue.
+  A backend must therefore be quick and must not depend on the event loop; an
+  asynchronous Redis client is not suitable.
+
+- **release**
+
+      $lock->release($guard);
+
+  Release a guard returned by `acquire`.  The guard is opaque to the plugin.
+  Releasing a lock that has already expired is allowed.  If release fails, the
+  lock should expire on its own; the backend can return `(0, $error)` so the
+  failure is logged.
+
+The cache itself must still be shared between the workers.  The built-in
+backends are [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
+selected with ["cache\_lock\_dir"](#cache_lock_dir), and
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis).
+`cache_lock` cannot be combined with ["cache\_lock\_dir"](#cache_lock_dir), and is
+read when the plugin is registered rather than per response.
 
 ## cache\_lock\_timeout
 
@@ -248,7 +340,12 @@ finishes.  Fractional seconds are allowed, so `0.5` is valid.
 
 A directory in which to keep lock files used to coalesce cache misses across
 worker processes, defaults to undef, which limits single-flight to one worker.
-The plugin creates the directory if necessary.
+This selects the built-in
+[Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile)
+backend and is a shorthand for `cache_lock =>
+Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir)`.  The plugin
+creates the directory if necessary.  It cannot be combined with
+["cache\_lock"](#cache_lock).
 
 The workers must share this directory and the cache itself.  A per-worker
 cache such as CHI's `Memory` driver cannot be used, because a request in one
@@ -260,8 +357,10 @@ tiny and can be deleted while the application is stopped.  Use a private
 directory.
 
 This works for [hypnotoad](https://metacpan.org/pod/hypnotoad) workers on the same host, or on a shared
-filesystem that implements `flock` reliably.  It is read when the plugin is
-registered, not per response.
+filesystem that implements `flock` reliably.  For workers on different hosts,
+use ["cache\_lock"](#cache_lock) with
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
+instead.  It is read when the plugin is registered, not per response.
 
 ## vary\_by
 
@@ -316,9 +415,9 @@ listed in ["vary\_by"](#vary_by); use ["cache\_key"](#cache_key) to replace it. 
 is significant.
 
 Concurrent misses for the same key are coalesced within a worker, or across
-workers when ["cache\_lock\_dir"](#cache_lock_dir) is set: while one request is building an
-entry, later requests wait for it and replay the result instead of running
-the action again.  The waiting requests are held asynchronously, so this
+workers when ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) is set:
+while one request is building an entry, later requests wait for it and replay
+the result instead of running the action again.  The waiting requests are held asynchronously, so this
 works for actions that themselves use the event loop.  See
 ["cache\_single\_flight"](#cache_single_flight) for the failure and timeout behaviour.
 
@@ -332,10 +431,10 @@ hit.  To disable the cache for one response, use
 
 [hypnotoad](https://metacpan.org/pod/hypnotoad) preloads the application
 before forking the workers, so the plugin is registered once and every worker
-inherits the same cache object and lock directory.  The cache storage and the
-lock directory must be shared and writable by the user that runs the workers.
-The example below uses [CHI](https://metacpan.org/pod/CHI), which must be
-installed in the application's environment.
+inherits the same cache object and lock backend.  The cache storage, and the
+storage used by the lock backend, must be shared and writable by the user that
+runs the workers.  The example below uses [CHI](https://metacpan.org/pod/CHI),
+which must be installed in the application's environment.
 
 A complete application:
 
@@ -376,6 +475,9 @@ A complete application:
 
     1;
 
+A runnable copy of this example, with its paths under `eg/hypnotoad`, is
+included as [eg/hypnotoad](eg/hypnotoad).
+
 `script/my_app` is the usual launcher:
 
     #!/usr/bin/env perl
@@ -402,12 +504,55 @@ permissions.  The cache directory must be writable by that user too.  Use
 
 ## Cache and lock requirements
 
-[CHI](https://metacpan.org/pod/CHI)'s `File` driver works for workers on the
-same host.  Do not use `Memory`, and do not put a per-worker `L1` cache in
-front of the shared cache: a waiting worker would not see the entry built by
-another worker and would eventually receive `503 Service Unavailable`.  Workers
-on different hosts need a cache and lock directory on a shared filesystem that
-implements `flock` reliably.
+For workers on the same host, [CHI](https://metacpan.org/pod/CHI)'s `File` driver
+and the built-in file lock backend work.  Do not use `Memory`, and do not put a
+per-worker `L1` cache in front of the shared cache: a waiting worker would not
+see the entry built by another worker and would eventually receive `503
+Service Unavailable`.  A shared filesystem with reliable `flock` can also be
+used on several hosts.
+
+## Multiple hosts
+
+Workers on different hosts need a shared cache and a lock backend that does not
+rely on `flock`.  This example uses CHI's Memcached driver for the cache and
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
+for the lock, with the [Redis](https://metacpan.org/pod/Redis) client:
+
+    use CHI;
+    use Mojolicious::Plugin::Buffer::Lock::Redis;
+    use Redis;
+
+    my $redis = sub {
+        Redis->new(
+            server        => 'redis://redis.internal:6379',
+            cnx_timeout   => 1,
+            read_timeout  => 1,
+            write_timeout => 1,
+        );
+    };
+
+    $app->plugin('Buffer' => {
+        cache => CHI->new(
+            driver    => 'Memcached',
+            servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
+            namespace => 'pages',
+        ),
+        cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
+            redis     => $redis,
+            namespace => 'myapp:buffer:',
+            ttl       => 60,
+        ),
+        cache_duration => '10 minutes',
+    });
+
+The `ttl` must be longer than ["cache\_lock\_timeout"](#cache_lock_timeout) and
+longer than the slowest cached action.  If it expires while the builder is
+still working, another worker can start building the same entry.  The Redis
+client is called synchronously, so set short connect, read and write timeouts.
+The code reference is called once per worker, after the fork; a connection
+created in `startup` would be shared by every worker and must not be used.
+CHI's Memcached driver needs
+[Cache::Memcached::Fast](https://metacpan.org/pod/Cache%3A%3AMemcached%3A%3AFast).
 
 Only cache pages that are identical for every visitor.  The default key
 includes the `Cookie` header, not the contents of the session, so a page that
@@ -417,6 +562,17 @@ script or a template changes, and otherwise expire after
 ["cache\_duration"](#cache_duration).
 
 # NOTES
+
+## Testing
+
+The Redis lock backend has an optional live integration test.  It skips when
+`MPB_REDIS_URL` (or `REDIS_URL`) is not set, or when the [Redis](https://metacpan.org/pod/Redis) client
+is not installed.  When a URL is set, the test expects that server to be
+reachable:
+
+    MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+
+The normal test suite does not require a Redis server.
 
 ## Why a plugin?
 
@@ -474,8 +630,9 @@ analytics cookie on every visit will get little sharing; use
 `vary_by => []` for genuinely public pages, or ["cache\_key"](#cache_key).
 - Single-flight is per worker by default.  Each `hypnotoad` worker
 keeps its own in-flight table, so a cold entry can be built once per worker;
-set ["cache\_lock\_dir"](#cache_lock_dir) to coalesce across workers, with a shared cache.  A
-request waiting on an in-flight response is answered with `503` if that
+set ["cache\_lock"](#cache_lock) or ["cache\_lock\_dir"](#cache_lock_dir) to coalesce
+across workers, with a shared cache.  A request waiting on an in-flight
+response is answered with `503` if that
 response fails, cannot be cached, or exceeds ["cache\_lock\_timeout"](#cache_lock_timeout), rather
 than running the action a second time.
 - Entries are invalidated when the application script or a template
@@ -484,7 +641,9 @@ backstop for those.
 
 # SEE ALSO
 
-[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker), [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin)
+[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker), [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin),
+[Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
+[Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis)
 
 # AUTHOR
 

@@ -4,13 +4,11 @@ use Mojo::Base 'Mojolicious::Plugin';
 
 use Carp qw(croak);
 use Encode ();
-use Errno qw(EAGAIN EWOULDBLOCK);
-use Fcntl qw(:flock O_CREAT O_RDWR);
-use File::Path ();
 use File::Spec ();
 use Mojo::Date;
 use Mojo::IOLoop;
 use Mojo::Util qw(gzip md5_sum);
+use Mojolicious::Plugin::Buffer::Lock::File;
 use Scalar::Util qw(blessed refaddr);
 use Time::HiRes ();
 
@@ -39,6 +37,8 @@ my %DEFAULTS = (
 	generate_etag      => 1,
 	generate_304       => 1,
 	last_modified      => 1,	# 0 = off, 1 = newest app/template mtime, epoch, date string or coderef
+	template_mtime_cache => undef,	# cache object for the template mtime scan
+	template_mtime_cache_duration => 10,	# seconds to keep a cached template mtime
 	min_compress_size  => 32,
 	encodings          => [@DEFAULT_ENCODINGS],
 	compressible_types => [@DEFAULT_COMPRESSIBLE_TYPES],
@@ -48,6 +48,7 @@ my %DEFAULTS = (
 	cache_key          => undef,	# string or coderef, overriding the generated key
 	cache_single_flight => 1,	# let one request build a missing entry, others wait
 	cache_lock_timeout => 10,	# seconds before waiters give up
+	cache_lock         => undef,	# pluggable lock backend object
 	cache_lock_dir     => undef,	# directory of shared lock files, for multiple workers
 	vary_by            => ['cookie'],	# request headers that become part of the cache key
 );
@@ -245,11 +246,66 @@ directories under the renderer's C<paths>, so editing a template changes
 C<Last-Modified> and discards cache entries built from the old one.  C<morbo>
 and C<hypnotoad> set C<$0> to your application script, but under a PSGI or
 module-only deployment it may be the wrapper instead; pass an explicit epoch
-or a coderef there.  The template paths are scanned once per request, so for
-a large tree or an application that does not use templates, an explicit
-epoch or coderef is cheaper.  Database rows and other inputs are not
-covered; use a coderef for pages whose freshness depends on them, or set
-C<last_modified =E<gt> 0> and rely on L</generate_etag> alone.
+or a coderef there.  The template paths are scanned once per request, unless
+L</template_mtime_cache> is configured, so for a large tree or an application
+that does not use templates, an explicit epoch or coderef is cheaper.
+Database rows and other inputs are not covered; use a coderef for pages whose
+freshness depends on them, or set C<last_modified =E<gt> 0> and rely on
+L</generate_etag> alone.
+
+=head2 Last-Modified performance
+
+The scan costs one C<stat()> per file and directory under the renderer's
+paths.  On a tree of 10,000 templates in 100 directories, a request using the
+default scan took about 40 milliseconds of CPU on the machine used for these
+measurements, against about 1 millisecond for the same request with an
+explicit epoch; that is roughly 4 microseconds per tree entry.  The numbers
+are indicative, not a promise, and a faster or slower filesystem will move
+them.  Run F<benchmarks/last_modified.pl> with your own tree size to measure
+it.
+
+Use an explicit epoch or a coderef when template changes do not need to move
+C<Last-Modified> and you do not rely on response-cache invalidation after a
+template edit.  Use L</template_mtime_cache> when you need template awareness
+but not a scan on every request: it costs one cache lookup per request and
+bounds how long a template edit can be missed by its duration.
+
+=head2 template_mtime_cache
+
+An optional cache object understanding C<get()> and C<set()>, such as a
+L<CHI> instance, used to remember the result of the template mtime scan.
+Defaults to undef, which scans the renderer's template paths on every
+request.  A per-worker cache avoids the scan without sharing anything:
+
+    use CHI;
+    plugin 'Buffer' => {
+        template_mtime_cache => CHI->new(driver => 'Memory', datastore => {}),
+    };
+
+A shared cache, such as CHI's File or Memcached driver, also avoids the scan
+for every worker.  Entries are keyed by the application class, the
+application script and its mtime, and the renderer's template paths, and are
+stored with L</template_mtime_cache_duration>.  A cache failure is logged at
+debug level and the scan runs as usual, so a broken cache cannot stop a
+response.
+
+For a large tree this is the middle ground: it avoids the per-request scan
+described under L</Last-Modified performance> while still noticing template
+changes, at the cost of up to one duration of staleness.
+
+The cached value is only refreshed when the entry expires.  A template edit
+therefore is not noticed until then, and neither C<Last-Modified> nor the
+cache invalidation described under L</last_modified> sees it immediately.
+Keep L</template_mtime_cache_duration> short if templates change often.
+
+This option and L</template_mtime_cache_duration> are read when the plugin is
+registered; they cannot be overridden through the C<buffer> stash.
+
+=head2 template_mtime_cache_duration
+
+How long a template mtime is kept, defaults to 10 seconds.  It is passed to
+the cache's C<set()>, so for L<CHI> it may be a number of seconds or a
+human-readable duration.
 
 =head2 min_compress_size
 
@@ -313,9 +369,45 @@ C<Retry-After: 1> rather than running the action itself.  Set to 0 to let
 every concurrent miss run the action independently.
 
 By default the in-flight table is per worker process, so with N L<hypnotoad>
-workers a cold entry can still be built up to N times.  Set
-L</cache_lock_dir> to a directory shared by the workers and they will elect a
-single builder across processes instead.
+workers a cold entry can still be built up to N times.  Set L</cache_lock> or
+L</cache_lock_dir> to elect a single builder across processes instead.
+
+=head2 cache_lock
+
+An optional object that elects one process to build a missing entry, for
+workers that cannot share a directory.  It must implement:
+
+=over 4
+
+=item acquire
+
+    my ($guard, $error) = $lock->acquire($key);
+
+Return a truthy guard if the lock was acquired, C<(undef, undef)> if another
+process holds it, and C<(undef, $error)> if the backend failed.  On an error
+the plugin logs the message and continues with a per-worker flight, so a
+cache miss is still built.
+
+The call is synchronous and runs before the action is allowed to continue.
+A backend must therefore be quick and must not depend on the event loop; an
+asynchronous Redis client is not suitable.
+
+=item release
+
+    $lock->release($guard);
+
+Release a guard returned by C<acquire>.  The guard is opaque to the plugin.
+Releasing a lock that has already expired is allowed.  If release fails, the
+lock should expire on its own; the backend can return C<(0, $error)> so the
+failure is logged.
+
+=back
+
+The cache itself must still be shared between the workers.  The built-in
+backends are L<Mojolicious::Plugin::Buffer::Lock::File>, selected with
+L</cache_lock_dir>, and L<Mojolicious::Plugin::Buffer::Lock::Redis>.
+C<cache_lock> cannot be combined with L</cache_lock_dir>, and is read when
+the plugin is registered rather than per response.
 
 =head2 cache_lock_timeout
 
@@ -328,7 +420,11 @@ finishes.  Fractional seconds are allowed, so C<0.5> is valid.
 
 A directory in which to keep lock files used to coalesce cache misses across
 worker processes, defaults to undef, which limits single-flight to one worker.
-The plugin creates the directory if necessary.
+This selects the built-in L<Mojolicious::Plugin::Buffer::Lock::File> backend
+and is a shorthand for C<cache_lock =E<gt>
+Mojolicious::Plugin::Buffer::Lock::File-E<gt>new(dir =E<gt> $dir)>.  The
+plugin creates the directory if necessary.  It cannot be combined with
+L</cache_lock>.
 
 The workers must share this directory and the cache itself.  A per-worker
 cache such as CHI's C<Memory> driver cannot be used, because a request in one
@@ -340,8 +436,10 @@ tiny and can be deleted while the application is stopped.  Use a private
 directory.
 
 This works for L<hypnotoad> workers on the same host, or on a shared
-filesystem that implements C<flock> reliably.  It is read when the plugin is
-registered, not per response.
+filesystem that implements C<flock> reliably.  For workers on different
+hosts, use L</cache_lock> with
+L<Mojolicious::Plugin::Buffer::Lock::Redis> instead.  It is read when the
+plugin is registered, not per response.
 
 =head2 vary_by
 
@@ -396,9 +494,9 @@ listed in L</vary_by>; use L</cache_key> to replace it.  Query argument order
 is significant.
 
 Concurrent misses for the same key are coalesced within a worker, or across
-workers when L</cache_lock_dir> is set: while one request is building an
-entry, later requests wait for it and replay the result instead of running
-the action again.  The waiting requests are held asynchronously, so this
+workers when L</cache_lock> or L</cache_lock_dir> is set: while one request
+is building an entry, later requests wait for it and replay the result
+instead of running the action again.  The waiting requests are held asynchronously, so this
 works for actions that themselves use the event loop.  See
 L</cache_single_flight> for the failure and timeout behaviour.
 
@@ -438,21 +536,31 @@ sub register {
 		croak 'Mojolicious::Plugin::Buffer: cache must be an object understanding get(), set() and remove()'
 			unless blessed($cache) && $cache->can('get') && $cache->can('set') && $cache->can('remove');
 	}
+	if (defined(my $mtime_cache = $options{template_mtime_cache})) {
+		croak 'Mojolicious::Plugin::Buffer: template_mtime_cache must be an object understanding get() and set()'
+			unless blessed($mtime_cache) && $mtime_cache->can('get') && $mtime_cache->can('set');
+	}
+	if (defined($options{template_mtime_cache_duration}) &&
+	  (ref($options{template_mtime_cache_duration}) || !length($options{template_mtime_cache_duration}))) {
+		croak 'Mojolicious::Plugin::Buffer: template_mtime_cache_duration must be a duration';
+	}
 	if (defined($options{cache_lock_timeout}) &&
 	  (ref($options{cache_lock_timeout}) || $options{cache_lock_timeout} !~ /^\d+(?:\.\d+)?$/ || $options{cache_lock_timeout} <= 0)) {
 		croak 'Mojolicious::Plugin::Buffer: cache_lock_timeout must be a positive number of seconds';
 	}
 
-	# A shared lock directory makes single-flight work across worker processes
-	my $lock_dir;
-	if (defined(my $dir = $options{cache_lock_dir})) {
-		croak 'Mojolicious::Plugin::Buffer: cache_lock_dir must be a directory path'
-			if ref($dir) || !length($dir);
-		eval { File::Path::make_path($dir) };
-		croak "Mojolicious::Plugin::Buffer: cannot create cache_lock_dir '$dir': $@" if $@;
-		croak "Mojolicious::Plugin::Buffer: cache_lock_dir '$dir' is not a writable directory"
-			unless -d $dir && -w $dir;
-		$lock_dir = $dir;
+	# A lock backend makes single-flight work across worker processes.
+	# cache_lock_dir is a shorthand for the built-in file backend.
+	my $lock;
+	if (defined(my $backend = $options{cache_lock})) {
+		croak 'Mojolicious::Plugin::Buffer: cache_lock and cache_lock_dir cannot be combined'
+			if defined($options{cache_lock_dir});
+		croak 'Mojolicious::Plugin::Buffer: cache_lock must be an object with acquire() and release() methods'
+			unless blessed($backend) && $backend->can('acquire') && $backend->can('release');
+		$lock = $backend;
+	}
+	elsif (defined(my $dir = $options{cache_lock_dir})) {
+		$lock = Mojolicious::Plugin::Buffer::Lock::File->new(dir => $dir);
 	}
 
 	# Normalise and check the requested content codings
@@ -479,7 +587,7 @@ sub register {
 	# from working on anything bigger than 860 bytes.  Take over that job.
 	$app->renderer->compress(0);
 
-	my $state = {options => \%options, inflight => {}, lock_dir => $lock_dir};
+	my $state = {options => \%options, inflight => {}, lock => $lock};
 
 	$app->hook(after_dispatch => sub {
 		my $c = shift;
@@ -747,13 +855,12 @@ sub _cache_miss {
 		return _join_flight($c, $state, $flight);
 	}
 
-	# With a shared lock directory, elect one worker to build the entry and
-	# make the others wait for it, even though they cannot share the flight
-	# table above.
+	# With a lock backend, elect one worker to build the entry and make the
+	# others wait for it, even though they cannot share the flight table above.
 	my $lock;
-	if ($state->{lock_dir}) {
+	if ($state->{lock}) {
 		my $error;
-		($lock, $error) = _acquire_lock($state->{lock_dir}, $key);
+		($lock, $error) = _acquire_lock($state->{lock}, $key);
 		if (!$lock) {
 			if (defined($error)) {
 				$c->app->log->error("Buffer: shared cache lock failed: $error");
@@ -871,7 +978,7 @@ sub _join_shared_lock {
 
 		# If the lock can be taken, the builder has finished.  Hold it while
 		# checking again so that a new builder cannot start in between.
-		my ($lock, $error) = _acquire_lock($state->{lock_dir}, $key);
+		my ($lock, $error) = _acquire_lock($state->{lock}, $key);
 		if (!$lock) {
 			return unless defined($error);
 			$done = 1;
@@ -882,7 +989,8 @@ sub _join_shared_lock {
 		}
 
 		my ($late) = _lookup_entry($c, $cache, $key, $state, 0);
-		_release_lock($lock);
+		my ($released, $release_error) = _release_lock($state->{lock}, $lock);
+		$c->app->log->error("Buffer: shared cache unlock failed: $release_error") unless $released;
 		$done = 1;
 		Mojo::IOLoop->remove($poll);
 
@@ -960,7 +1068,8 @@ sub _release_flight {
 	}
 
 	if (my $lock = delete $flight->{lock}) {
-		_release_lock($lock);
+		my ($released, $error) = _release_lock($state->{lock}, $lock);
+		$app->log->error("Buffer: shared cache unlock failed: $error") unless $released;
 	}
 
 	return;
@@ -1011,39 +1120,39 @@ sub _lock_timeout {
 	return $timeout + 0;
 }
 
-# Take a non-blocking flock on a file named after the cache key.  Returns a
-# guard on success, or (undef, undef) when another worker holds it.  Any
-# other failure returns (undef, error), so the caller can fall back to a
-# per-worker flight rather than breaking the request.
+# Call a pluggable lock backend.  A backend may die, so exceptions are
+# converted into errors and the caller can fall back to a per-worker flight
+# rather than breaking the request.
 sub _acquire_lock {
-	my ($dir, $key) = @_;
+	my ($backend, $key) = @_;
 
-	my $path = "$dir/" . md5_sum($key) . '.lock';
-	my $fh;
-	unless (sysopen($fh, $path, O_RDWR | O_CREAT, 0666)) {
-		return (undef, "cannot open $path: $!");
+	my ($guard, $error);
+	my $ok = eval { ($guard, $error) = $backend->acquire($key); 1 };
+	if (!$ok) {
+		my $exception = $@;
+		chomp($exception);
+		return (undef, $exception);
 	}
 
-	if (flock($fh, LOCK_EX | LOCK_NB)) {
-		return ({fh => $fh, path => $path}, undef);
-	}
-
-	my $error = "$!";
-	my $errno = 0 + $!;
-	close($fh);
-
-	return (undef, undef) if ($errno == EWOULDBLOCK) || ($errno == EAGAIN);
-	return (undef, "cannot lock $path: $error");
+	return $guard ? ($guard, $error) : (undef, $error);
 }
 
 sub _release_lock {
-	my $lock = shift;
+	my ($backend, $lock) = @_;
 
-	return unless $lock && $lock->{fh};
-	flock($lock->{fh}, LOCK_UN);
-	close(delete $lock->{fh});
+	return (1, undef) unless $lock;
 
-	return;
+	my ($ok, $error);
+	my $success = eval { ($ok, $error) = $backend->release($lock); 1 };
+	if (!$success) {
+		my $exception = $@;
+		chomp($exception);
+		return (0, $exception);
+	}
+
+	# A backend that returns nothing is treated as having released the lock
+	return (1, undef) unless defined($ok);
+	return $ok ? (1, $error) : (0, $error // 'unknown error');
 }
 
 sub _store_in_cache {
@@ -1176,6 +1285,18 @@ sub _application_mtime {
 	my $key = 'buffer.application_mtime';
 	return $c->stash->{$key} if exists($c->stash->{$key});
 
+	my $cache = $state->{options}{template_mtime_cache};
+	my $cache_key;
+	if ($cache) {
+		$cache_key = _template_mtime_cache_key($c, $state);
+		my $cached = eval { $cache->get($cache_key) };
+		if (my $error = $@) {
+			$c->app->log->debug("Buffer: template mtime cache get failed: $error");
+		} elsif (defined($cached) && $cached =~ /^\d+$/) {
+			return $c->stash->{$key} = $cached;
+		}
+	}
+
 	my $latest = _script_mtime($state);
 	my %seen;
 	for my $dir (@{$c->app->renderer->paths || []}) {
@@ -1183,7 +1304,27 @@ sub _application_mtime {
 		$latest = _latest_mtime($dir, $latest, \%seen);
 	}
 
+	if ($cache && defined($latest)) {
+		my $duration = $state->{options}{template_mtime_cache_duration};
+		$duration = 10 unless defined($duration) && !ref($duration) && length($duration);
+		my $stored = eval { $cache->set($cache_key, $latest, $duration) };
+		if (my $error = $@) {
+			$c->app->log->debug("Buffer: template mtime cache set failed: $error");
+		} elsif (!$stored) {
+			$c->app->log->debug('Buffer: template mtime cache did not store the scan');
+		}
+	}
+
 	return $c->stash->{$key} = $latest;
+}
+
+sub _template_mtime_cache_key {
+	my ($c, $state) = @_;
+
+	my @parts = (ref($c->app), defined($0) ? $0 : '', _script_mtime($state) // '');
+	push @parts, map { defined($_) ? $_ : '' } @{$c->app->renderer->paths || []};
+
+	return 'buffer:template-mtime:' . md5_sum(join "\0", @parts);
 }
 
 # Include directory mtimes as well as file mtimes: editing a file moves the
@@ -1507,9 +1648,10 @@ sub _matches {
 
 L<hypnotoad> preloads the application before forking the workers, so the
 plugin is registered once and every worker inherits the same cache object
-and lock directory.  The cache storage and the lock directory must be
-shared and writable by the user that runs the workers.  The example below
-uses L<CHI>, which must be installed in the application's environment.
+and lock backend.  The cache storage, and the storage used by the lock
+backend, must be shared and writable by the user that runs the workers.  The
+example below uses L<CHI>, which must be installed in the application's
+environment.
 
 A complete application:
 
@@ -1550,6 +1692,9 @@ A complete application:
 
     1;
 
+A runnable copy of this example, with its paths under C<eg/hypnotoad>, is
+included as F<eg/hypnotoad>.
+
 C<script/my_app> is the usual launcher:
 
     #!/usr/bin/env perl
@@ -1576,12 +1721,54 @@ C<hypnotoad -s script/my_app> to stop it.
 
 =head2 Cache and lock requirements
 
-L<CHI>'s C<File> driver works for workers on the same host.  Do not use
-C<Memory>, and do not put a per-worker C<L1> cache in front of the shared
-cache: a waiting worker would not see the entry built by another worker and
-would eventually receive C<503 Service Unavailable>.  Workers on different
-hosts need a cache and lock directory on a shared filesystem that implements
-C<flock> reliably.
+For workers on the same host, L<CHI>'s C<File> driver and the built-in file
+lock backend work.  Do not use C<Memory>, and do not put a per-worker C<L1>
+cache in front of the shared cache: a waiting worker would not see the entry
+built by another worker and would eventually receive C<503 Service
+Unavailable>.  A shared filesystem with reliable C<flock> can also be used
+on several hosts.
+
+=head2 Multiple hosts
+
+Workers on different hosts need a shared cache and a lock backend that does
+not rely on C<flock>.  This example uses CHI's Memcached driver for the cache
+and L<Mojolicious::Plugin::Buffer::Lock::Redis> for the lock, with the
+L<Redis> client:
+
+    use CHI;
+    use Mojolicious::Plugin::Buffer::Lock::Redis;
+    use Redis;
+
+    my $redis = sub {
+        Redis->new(
+            server        => 'redis://redis.internal:6379',
+            cnx_timeout   => 1,
+            read_timeout  => 1,
+            write_timeout => 1,
+        );
+    };
+
+    $app->plugin('Buffer' => {
+        cache => CHI->new(
+            driver    => 'Memcached',
+            servers   => ['cache1.internal:11211', 'cache2.internal:11211'],
+            namespace => 'pages',
+        ),
+        cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
+            redis     => $redis,
+            namespace => 'myapp:buffer:',
+            ttl       => 60,
+        ),
+        cache_duration => '10 minutes',
+    });
+
+The C<ttl> must be longer than L</cache_lock_timeout> and longer than the
+slowest cached action.  If it expires while the builder is still working,
+another worker can start building the same entry.  The Redis client is
+called synchronously, so set short connect, read and write timeouts.  The
+code reference is called once per worker, after the fork; a connection
+created in C<startup> would be shared by every worker and must not be used.
+CHI's Memcached driver needs L<Cache::Memcached::Fast>.
 
 Only cache pages that are identical for every visitor.  The default key
 includes the C<Cookie> header, not the contents of the session, so a page
@@ -1590,6 +1777,17 @@ list.  Entries are discarded when the application script or a template
 changes, and otherwise expire after L</cache_duration>.
 
 =head1 NOTES
+
+=head2 Testing
+
+The Redis lock backend has an optional live integration test.  It skips when
+C<MPB_REDIS_URL> (or C<REDIS_URL>) is not set, or when the L<Redis> client
+is not installed.  When a URL is set, the test expects that server to be
+reachable:
+
+    MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+
+The normal test suite does not require a Redis server.
 
 =head2 Why a plugin?
 
@@ -1656,8 +1854,9 @@ C<vary_by =E<gt> []> for genuinely public pages, or L</cache_key>.
 
 =item * Single-flight is per worker by default.  Each C<hypnotoad> worker
 keeps its own in-flight table, so a cold entry can be built once per worker;
-set L</cache_lock_dir> to coalesce across workers, with a shared cache.  A
-request waiting on an in-flight response is answered with C<503> if that
+set L</cache_lock> or L</cache_lock_dir> to coalesce across workers, with a
+shared cache.  A request waiting on an in-flight response is answered with
+C<503> if that
 response fails, cannot be cached, or exceeds L</cache_lock_timeout>, rather
 than running the action a second time.
 
@@ -1669,7 +1868,9 @@ backstop for those.
 
 =head1 SEE ALSO
 
-L<CGI::Buffer>, L<FCGI::Buffer>, L<CHI>, L<HTML::Packer>, L<Mojolicious::Plugin>
+L<CGI::Buffer>, L<FCGI::Buffer>, L<CHI>, L<HTML::Packer>,
+L<Mojolicious::Plugin>, L<Mojolicious::Plugin::Buffer::Lock::File>,
+L<Mojolicious::Plugin::Buffer::Lock::Redis>
 
 =head1 AUTHOR
 

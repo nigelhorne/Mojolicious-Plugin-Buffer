@@ -10,7 +10,8 @@ $| = 1;
 
 # The optional modules named in Makefile.PL.  Hiding them in the child
 # processes is what makes the fallback paths, particularly the one without
-# HTML::Packer, real rather than simulated.
+# HTML::Packer, real rather than simulated.  The level 2 fallback lives in
+# 20-optimise.t, so there is no separate simulated no-Packer test file.
 my @MODULES = qw(HTML::Packer CHI IO::Compress::Brotli Compress::Zstd);
 
 my $have_test_without_module = eval { require Test::Without::Module; 1 };

@@ -58,7 +58,12 @@ sub build_app {
 	return $app;
 }
 
-my $t = Test::Mojo->new(build_app(optimise_content => 1));
+my $app = build_app(optimise_content => 1);
+my $log = '';
+open(my $log_fh, '>', \$log) or die $!;
+$app->log->handle($log_fh);
+
+my $t = Test::Mojo->new($app);
 $t->ua->transactor->compressed(0);
 
 subtest 'HTML is optimised' => sub {
@@ -70,6 +75,7 @@ subtest 'HTML is optimised' => sub {
 		unlike($body, qr/remove this comment/, 'comments are removed');
 	} else {
 		like($body, qr/remove this comment/, 'comments are kept without HTML::Packer');
+		unlike($log, qr/HTML::Packer failed/, 'no HTML::Packer failure was logged');
 	}
 	unlike($body, qr/\n\s*\n/, 'blank lines are removed');
 	like($body, qr{<a href="/page">}, 'absolute link to this site became root-relative');
@@ -96,6 +102,25 @@ subtest 'optimisation is off by default' => sub {
 	$default->ua->transactor->compressed(0);
 	$default->get_ok('/opt')->status_is(200);
 	like($default->tx->res->body, qr/remove this comment/, 'comments are kept');
+};
+
+subtest 'level 2 works without HTML::Packer' => sub {
+	plan skip_all => 'HTML::Packer is installed' if $HAVE_PACKER;
+
+	my $app = build_app(optimise_content => 2);
+	my $log = '';
+	open(my $log_fh, '>', \$log) or die $!;
+	$app->log->handle($log_fh);
+
+	my $t = Test::Mojo->new($app);
+	$t->ua->transactor->compressed(0);
+	$t->get_ok('/opt')->status_is(200);
+
+	my $body = $t->tx->res->body;
+	like($body, qr/<p>Hello World<\/p>/, 'white space is still squashed');
+	like($body, qr/remove this comment/, 'comments are still left alone');
+	like($body, qr/var answer = 42/, 'JavaScript is still preserved');
+	unlike($log, qr/HTML::Packer failed/, 'no HTML::Packer failure is logged');
 };
 
 done_testing();

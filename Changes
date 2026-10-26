@@ -2,3 +2,27 @@ Revision history for Mojolicious-Plugin-Buffer
 
 0.001.0
 	Initial version.
+	Make the different-keys single-flight test independent of the order in
+	which concurrent requests reach their actions.
+	Fold the simulated no-HTML::Packer test into the hidden-module suite,
+	including level 2 coverage.
+	Test added, deleted and symlinked template directories, covering
+	directory mtimes and symlink-loop protection.
+	Add template_mtime_cache and template_mtime_cache_duration so the
+	template tree scan can be cached, including across workers.
+	Test cache hits, expiry, scan fallback and option validation.
+	Benchmark the default template mtime scan against an explicit epoch
+	on a 10,000-template tree and document the trade-off.
+	Test a hypnotoad waiter receiving 503 when another worker holds the
+	shared lock past cache_lock_timeout.
+	Test that a hypnotoad worker killed while holding the shared lock
+	releases it for the remaining workers.
+	Assert that the concurrent cold requests used more than one worker
+	pid, so cross-worker locking is actually exercised.
+	Add a runnable hypnotoad example under eg/hypnotoad.
+	Add an optional live Redis integration test, skipped unless
+	MPB_REDIS_URL or REDIS_URL is configured.
+	Audit the concurrency tests for completion-order assumptions: release
+	the shared lock only once the waiter has joined, for the file, Redis and
+	cross-process backends, and flush the cross-process handshake so a
+	waiting request is not served from an entry filled before it arrived.

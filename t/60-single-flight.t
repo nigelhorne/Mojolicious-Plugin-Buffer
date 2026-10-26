@@ -132,8 +132,12 @@ subtest 'different keys do not wait for each other' => sub {
 
 	is($t->app->{runs}, 2, 'both keys ran the action');
 	is(x_cache(@tx), 'MISS,MISS', 'both were misses');
-	is($tx[0]->res->body, 'slow run 1', 'the first request got its own page');
-	is($tx[1]->res->body, 'slow run 2', 'the second request got its own page');
+
+	# Requests can be dispatched in either order, so do not tie a run number
+	# to a particular transaction; each key must still get its own response.
+	my @bodies = map { $_->res->body } @tx;
+	isnt($bodies[0], $bodies[1], 'the two requests got different pages');
+	is_deeply([sort @bodies], ['slow run 1', 'slow run 2'], 'each key ran its own action');
 };
 
 subtest 'single-flight can be turned off' => sub {

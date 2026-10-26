@@ -66,6 +66,12 @@ subtest 'options are validated' => sub {
 
 	eval { Mojolicious->new->plugin('Buffer', cache_lock_timeout => 'soon') };
 	like($@, qr/cache_lock_timeout must be a positive number/, 'the lock timeout must be a number');
+
+	eval { Mojolicious->new->plugin('Buffer', template_mtime_cache => {}) };
+	like($@, qr/template_mtime_cache must be an object/, 'the mtime cache must be an object');
+
+	eval { Mojolicious->new->plugin('Buffer', template_mtime_cache_duration => {}) };
+	like($@, qr/template_mtime_cache_duration must be a duration/, 'the mtime cache duration must be a duration');
 };
 
 subtest 'multibyte bodies get a byte length' => sub {
