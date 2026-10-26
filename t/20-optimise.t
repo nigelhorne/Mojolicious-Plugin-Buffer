@@ -1,0 +1,98 @@
+use strict;
+use warnings;
+
+use Test::More;
+use Mojolicious;
+use Test::Mojo;
+
+eval { require HTML::Packer; 1 }
+	or plan skip_all => 'HTML::Packer is required to test optimisation';
+
+my $HTML = <<'HTML';
+<html>
+  <head>
+    <title>  A  test  page  </title>
+    <!-- remove this comment -->
+    <style>
+      .header { color: red; }
+    </style>
+  </head>
+  <body>
+    <div>   <p>Hello   World</p>   </div>
+    <a href="__ORIGIN__/page">A page</a>
+    <a href="__ORIGIN__/search?q=perl">A search</a>
+    <a href="__PATH__?q=perl">This page again</a>
+    <img src="__ORIGIN__/logo.png">
+    <script>
+      var answer = 42;
+    </script>
+  </body>
+</html>
+HTML
+
+sub build_app {
+	my (%options) = @_;
+
+	my $app = Mojolicious->new;
+	$app->log->level('error');
+	$app->plugin('Buffer', %options);
+
+	$app->routes->get('/opt' => sub {
+		my $c = shift;
+		my $url = $c->req->url->to_abs;
+		my $origin = $url->scheme . '://' . ($url->host_port // $url->host);
+		my $path = $url->path->to_string;
+		(my $html = $HTML) =~ s/__ORIGIN__/$origin/g;
+		$html =~ s/__PATH__/$path/g;
+		$c->render(text => $html);
+	});
+	$app->routes->get('/plain' => sub {
+		my $c = shift;
+		$c->render(data => $HTML, format => 'txt');
+	});
+	$app->routes->get('/off' => sub {
+		my $c = shift;
+		$c->stash(buffer => {optimise_content => 0});
+		$c->render(text => $HTML);
+	});
+
+	return $app;
+}
+
+my $t = Test::Mojo->new(build_app(optimise_content => 1));
+$t->ua->transactor->compressed(0);
+
+subtest 'HTML is optimised' => sub {
+	$t->get_ok('/opt')->status_is(200);
+
+	my $body = $t->tx->res->body;
+	cmp_ok(length($body), '<', length($HTML), 'body is smaller than the original');
+	unlike($body, qr/remove this comment/, 'comments are removed');
+	unlike($body, qr/\n\s*\n/, 'blank lines are removed');
+	like($body, qr{<a href="/page">}, 'absolute link to this site became root-relative');
+	like($body, qr{<a href="/search\?q=perl">}, 'absolute link with a query became root-relative');
+	like($body, qr{<a href="\?q=perl">}, 'link to the current page became a query-only link');
+	unlike($body, qr{<a href="/opt\?}, 'the current page path was dropped');
+	like($body, qr{<img src="/logo\.png">}, 'absolute image link became root-relative');
+	like($body, qr/var answer = 42/, 'JavaScript is preserved');
+	is($t->tx->res->headers->content_length, length($body), 'Content-Length matches the optimised body');
+};
+
+subtest 'only HTML is optimised' => sub {
+	$t->get_ok('/plain')->status_is(200);
+	is($t->tx->res->body, $HTML, 'text/plain is untouched');
+};
+
+subtest 'optimise_content can be turned off per response' => sub {
+	$t->get_ok('/off')->status_is(200);
+	is($t->tx->res->body, $HTML, 'body is untouched');
+};
+
+subtest 'optimisation is off by default' => sub {
+	my $default = Test::Mojo->new(build_app());
+	$default->ua->transactor->compressed(0);
+	$default->get_ok('/opt')->status_is(200);
+	like($default->tx->res->body, qr/remove this comment/, 'comments are kept');
+};
+
+done_testing();

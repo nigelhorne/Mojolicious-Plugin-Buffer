@@ -1,0 +1,13 @@
+Changes
+LICENSE
+Makefile.PL
+MANIFEST
+README.md
+lib/Mojolicious/Plugin/Buffer.pm
+t/00-load.t
+t/05-lite.t
+t/10-compress.t
+t/20-optimise.t
+t/30-validators.t
+t/40-options.t
+t/50-cache.t
