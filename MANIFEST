@@ -1,9 +1,9 @@
 Changes
+lib/Mojolicious/Plugin/Buffer.pm
 LICENSE
 Makefile.PL
 MANIFEST
 README.md
-lib/Mojolicious/Plugin/Buffer.pm
 t/00-load.t
 t/05-lite.t
 t/10-compress.t
