@@ -28,7 +28,9 @@ WriteMakefile(
 			: ()),
 	PL_FILES	=> {},
 	TEST_REQUIRES => {
+		'Mojo::Base' => 0,
 		'Test::More' => 0,
+		'Test::Without::Module' => 0,
 	},
 	PREREQ_PM => \%prereq_pm,
 	clean => { FILES => 'Mojolicious-Plugin-Buffer-*' },

@@ -4,11 +4,17 @@ use Mojo::Base 'Mojolicious::Plugin';
 
 use Carp qw(croak);
 use Encode ();
+use Errno qw(EAGAIN EWOULDBLOCK);
+use Fcntl qw(:flock O_CREAT O_RDWR);
+use File::Path ();
+use File::Spec ();
 use Mojo::Date;
+use Mojo::IOLoop;
 use Mojo::Util qw(gzip md5_sum);
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
+use Time::HiRes ();
 
-our $VERSION = '0.02';
+our $VERSION = '0.07';
 
 # Server preference order for content codings
 my @DEFAULT_ENCODINGS = qw(br zstd gzip);
@@ -32,7 +38,7 @@ my %DEFAULTS = (
 	rewrite_links      => 1,	# make same-site absolute links relative
 	generate_etag      => 1,
 	generate_304       => 1,
-	last_modified      => 0,	# 0 = off, 1 = mtime of the application script, epoch, date string or coderef
+	last_modified      => 1,	# 0 = off, 1 = newest app/template mtime, epoch, date string or coderef
 	min_compress_size  => 32,
 	encodings          => [@DEFAULT_ENCODINGS],
 	compressible_types => [@DEFAULT_COMPRESSIBLE_TYPES],
@@ -40,6 +46,9 @@ my %DEFAULTS = (
 	cache              => undef,	# a CHI-like cache object
 	cache_duration     => '10 minutes',
 	cache_key          => undef,	# string or coderef, overriding the generated key
+	cache_single_flight => 1,	# let one request build a missing entry, others wait
+	cache_lock_timeout => 10,	# seconds before waiters give up
+	cache_lock_dir     => undef,	# directory of shared lock files, for multiple workers
 	vary_by            => ['cookie'],	# request headers that become part of the cache key
 );
 
@@ -51,7 +60,7 @@ Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious respon
 
 =head1 VERSION
 
-Version 0.02
+Version 0.07
 
 =cut
 
@@ -169,17 +178,20 @@ How hard to optimise HTML, defaults to 0 (off):
 
 =item 0 - leave the HTML alone
 
-=item 1 - remove comments and superfluous white space, minify embedded CSS,
-and rewrite same-site links
+=item 1 - remove superfluous white space, rewrite same-site links and, when
+L<HTML::Packer> is installed, remove comments and minify embedded CSS
 
-=item 2 - as 1, plus aggressive JavaScript minification, which can break
-scripts that rely on the C<E<lt>!-- ... --E<gt>> hiding technique
+=item 2 - as 1, plus aggressive JavaScript minification when L<HTML::Packer>
+is installed, which can break scripts that rely on the
+C<E<lt>!-- ... --E<gt>> hiding technique
 
 =back
 
 Optimisation only applies to C<text/html> and C<application/xhtml+xml>
-responses.  It requires L<HTML::Packer>, which is checked for when the
-plugin is registered.
+responses.  L<HTML::Packer> is optional: without it the white-space
+squashing and link rewriting still run, but comments and embedded CSS and
+JavaScript are left alone, as they are by L<CGI::Buffer> and
+L<FCGI::Buffer>.  Install L<HTML::Packer> for the full effect.
 
 =head2 rewrite_links
 
@@ -198,19 +210,23 @@ representation of the same page have different tags.
 =head2 generate_304
 
 Answer conditional requests with C<304 Not Modified> when the
-C<If-None-Match> (or, failing that, C<If-Modified-Since>) header matches,
-defaults to 1.  Requires L</generate_etag> for the C<ETag> comparison.
+C<If-None-Match> (or, when it is absent, C<If-Modified-Since>) header
+matches, defaults to 1.  C<If-None-Match> takes precedence over
+C<If-Modified-Since>, as required by RFC 7232.  Requires L</generate_etag>
+for the C<ETag> comparison.
 
 =head2 last_modified
 
-Add a C<Last-Modified> header and honour C<If-Modified-Since>, defaults to 0
-(off).  May be:
+Add a C<Last-Modified> header and honour C<If-Modified-Since>, defaults to 1,
+which uses the newest modification time of the application script (C<$0>)
+and the renderer's template files and directories.  May be:
 
 =over 4
 
 =item 0 - do not generate the header
 
-=item 1 - use the modification time of the application script (C<$0>)
+=item 1 - use the newest modification time of the application script
+(C<$0>) and the files and directories under the renderer's template paths
 
 =item a number - a Unix epoch
 
@@ -223,6 +239,17 @@ Add a C<Last-Modified> header and honour C<If-Modified-Since>, defaults to 0
 The value is ignored for responses that are not C<200> responses to
 C<GET> or C<HEAD> requests.  If C<If-None-Match> is present it takes
 precedence over C<If-Modified-Since>, as required by RFC 7232.
+
+The default is the newest mtime of the application file and the files and
+directories under the renderer's C<paths>, so editing a template changes
+C<Last-Modified> and discards cache entries built from the old one.  C<morbo>
+and C<hypnotoad> set C<$0> to your application script, but under a PSGI or
+module-only deployment it may be the wrapper instead; pass an explicit epoch
+or a coderef there.  The template paths are scanned once per request, so for
+a large tree or an application that does not use templates, an explicit
+epoch or coderef is cheaper.  Database rows and other inputs are not
+covered; use a coderef for pages whose freshness depends on them, or set
+C<last_modified =E<gt> 0> and rely on L</generate_etag> alone.
 
 =head2 min_compress_size
 
@@ -269,6 +296,53 @@ A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
 when the response depends on something the default key does not cover.
 
+=head2 cache_single_flight
+
+Only let one request at a time build a missing entry, defaults to 1.  When a
+request misses the cache while another request in the same worker is already
+building the same key, the second request waits for the first one to finish
+and is then served the finished entry, without running the action.  This
+matters for asynchronous actions: a synchronous action runs to completion
+without the event loop doing anything else, so it cannot overlap with
+another request in the same worker.
+
+If the first request fails, produces a response that cannot be cached (for
+example one that sets a cookie), or takes longer than L</cache_lock_timeout>,
+the waiting request is answered with C<503 Service Unavailable> and
+C<Retry-After: 1> rather than running the action itself.  Set to 0 to let
+every concurrent miss run the action independently.
+
+By default the in-flight table is per worker process, so with N L<hypnotoad>
+workers a cold entry can still be built up to N times.  Set
+L</cache_lock_dir> to a directory shared by the workers and they will elect a
+single builder across processes instead.
+
+=head2 cache_lock_timeout
+
+How long a request may wait for another request, in this worker or another
+one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
+long a key is considered to be in flight when the request building it never
+finishes.  Fractional seconds are allowed, so C<0.5> is valid.
+
+=head2 cache_lock_dir
+
+A directory in which to keep lock files used to coalesce cache misses across
+worker processes, defaults to undef, which limits single-flight to one worker.
+The plugin creates the directory if necessary.
+
+The workers must share this directory and the cache itself.  A per-worker
+cache such as CHI's C<Memory> driver cannot be used, because a request in one
+worker cannot see the entry built in another; disable any per-worker C<L1>
+cache in front of a shared cache for the same reason.  Locks are non-blocking
+C<flock>s on one small, empty file per cache key, so they are released
+automatically if a worker dies.  The files are not removed, although they are
+tiny and can be deleted while the application is stopped.  Use a private
+directory.
+
+This works for L<hypnotoad> workers on the same host, or on a shared
+filesystem that implements C<flock> reliably.  It is read when the plugin is
+registered, not per response.
+
 =head2 vary_by
 
 An arrayref of request header names that become part of the generated cache
@@ -311,8 +385,8 @@ C<no-store>, C<no-cache>, C<private> or C<max-age=0> bypass the cache, as do
 requests made while the C<NO_CACHE> or C<NO_STORE> environment variable is
 set.  Responses that set a cookie, that are marked C<no-store> or
 C<private>, or that vary on something not listed in L</vary_by>, are not
-stored.  Entries created before the application script was last modified
-are treated as misses and removed.
+stored.  Entries created before the application script or any template file
+or directory was last modified are treated as misses and removed.
 
 The stored body is the optimised but uncompressed entity, so every hit is
 compressed for the requesting client, gets its own C<ETag> and can still be
@@ -320,6 +394,13 @@ answered with C<304 Not Modified>.  The cache key is a digest of the
 application class, host, path, query string and the values of the headers
 listed in L</vary_by>; use L</cache_key> to replace it.  Query argument order
 is significant.
+
+Concurrent misses for the same key are coalesced within a worker, or across
+workers when L</cache_lock_dir> is set: while one request is building an
+entry, later requests wait for it and replay the result instead of running
+the action again.  The waiting requests are held asynchronously, so this
+works for actions that themselves use the event loop.  See
+L</cache_single_flight> for the failure and timeout behaviour.
 
 Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
@@ -357,6 +438,22 @@ sub register {
 		croak 'Mojolicious::Plugin::Buffer: cache must be an object understanding get(), set() and remove()'
 			unless blessed($cache) && $cache->can('get') && $cache->can('set') && $cache->can('remove');
 	}
+	if (defined($options{cache_lock_timeout}) &&
+	  (ref($options{cache_lock_timeout}) || $options{cache_lock_timeout} !~ /^\d+(?:\.\d+)?$/ || $options{cache_lock_timeout} <= 0)) {
+		croak 'Mojolicious::Plugin::Buffer: cache_lock_timeout must be a positive number of seconds';
+	}
+
+	# A shared lock directory makes single-flight work across worker processes
+	my $lock_dir;
+	if (defined(my $dir = $options{cache_lock_dir})) {
+		croak 'Mojolicious::Plugin::Buffer: cache_lock_dir must be a directory path'
+			if ref($dir) || !length($dir);
+		eval { File::Path::make_path($dir) };
+		croak "Mojolicious::Plugin::Buffer: cannot create cache_lock_dir '$dir': $@" if $@;
+		croak "Mojolicious::Plugin::Buffer: cache_lock_dir '$dir' is not a writable directory"
+			unless -d $dir && -w $dir;
+		$lock_dir = $dir;
+	}
 
 	# Normalise and check the requested content codings
 	my @encodings;
@@ -371,11 +468,10 @@ sub register {
 	}
 	$options{encodings} = \@encodings;
 
-	# HTML::Packer is only needed when optimising, but fail at startup rather
-	# than in the middle of a request
-	if ($options{optimise_content}) {
-		_module_available('HTML::Packer')
-			or croak 'Mojolicious::Plugin::Buffer: optimise_content requires HTML::Packer';
+	# HTML::Packer is optional: without it the white-space squashing and link
+	# rewriting still run, as they do in CGI::Buffer and FCGI::Buffer
+	if ($options{optimise_content} && !_module_available('HTML::Packer')) {
+		$app->log->debug('Buffer: HTML::Packer is not installed, optimising white space only');
 	}
 
 	# L<Mojolicious::Renderer> gzips rendered output by default, before this
@@ -383,7 +479,7 @@ sub register {
 	# from working on anything bigger than 860 bytes.  Take over that job.
 	$app->renderer->compress(0);
 
-	my $state = {options => \%options};
+	my $state = {options => \%options, inflight => {}, lock_dir => $lock_dir};
 
 	$app->hook(after_dispatch => sub {
 		my $c = shift;
@@ -412,6 +508,11 @@ sub _module_available {
 	my $check = $MODULE_CHECK{$name}
 		or return 0;
 
+	# An ambient $SIG{__DIE__} handler can swallow the die from an @INC hook
+	# (Test::Without::Module uses one), which makes a hidden module look
+	# loadable.  Probe with the default handler so the load decides.
+	local $SIG{__DIE__};
+
 	return $check->() ? 1 : 0;
 }
 
@@ -427,7 +528,29 @@ sub _options_for {
 	return ($options, 0);
 }
 
+# Wrap the response pipeline so that a request which was building a cache
+# entry always releases the requests waiting for it, whether it succeeded,
+# failed, or produced something that must not be cached.
 sub _process {
+	my ($self, $c, $state) = @_;
+
+	my $flight = $c->stash->{'buffer.flight'};
+	my $ok = eval { $self->_process_response($c, $state); 1 };
+	my $error = $@;
+
+	if ($flight) {
+		my $released = eval {
+			_release_flight($c->app, $state, $flight, $c->stash->{'buffer.stored'});
+			1;
+		};
+		$c->app->log->error("Buffer: could not release waiting requests: $@") unless $released;
+	}
+
+	die $error unless $ok;
+	return;
+}
+
+sub _process_response {
 	my ($self, $c, $state) = @_;
 
 	my ($options, $disabled) = _options_for($c, $state);
@@ -523,18 +646,19 @@ sub _process {
 			my $if_none_match = $c->req->headers->if_none_match;
 			my $not_modified;
 
-			if (defined($etag)) {
-				if (defined($if_none_match)) {
-					$not_modified = _etag_matches($if_none_match, $etag);
-				} elsif (defined($last_modified) &&
-				  defined(my $since = $c->req->headers->if_modified_since)) {
-					my $since_epoch = eval { Mojo::Date->new($since)->epoch };
-					$not_modified = 1 if defined($since_epoch) && ($last_modified <= $since_epoch);
-				}
+			if (defined($if_none_match)) {
+				# If-None-Match takes precedence; If-Modified-Since is ignored
+				# even when there is no ETag to compare it with
+				$not_modified = defined($etag) ? _etag_matches($if_none_match, $etag) : 0;
+			} elsif (defined($last_modified) &&
+			  defined(my $since = $c->req->headers->if_modified_since)) {
+				my $since_epoch = eval { Mojo::Date->new($since)->epoch };
+				$not_modified = 1 if defined($since_epoch) && ($last_modified <= $since_epoch);
 			}
 
 			if ($not_modified) {
-				$c->app->log->debug("Buffer: not modified, sending 304 (ETag $etag)");
+				$c->app->log->debug('Buffer: not modified, sending 304'
+					. (defined($etag) ? " (ETag $etag)" : ''));
 				$res->code(304);
 				$res->body('');
 				$headers->remove('Content-Length');
@@ -557,6 +681,11 @@ sub _is_cached {
 	my ($options, $disabled) = _options_for($c, $state);
 	return 0 if $disabled;
 
+	# Calling the helper more than once should not replay a response twice
+	# or register the same request as a waiter again
+	return 1 if $c->stash->{'buffer.from_cache'} || $c->stash->{'buffer.cache_waiter'};
+	return 0 if $c->stash->{'buffer.flight'};
+
 	my $cache = $options->{cache};
 	return 0 unless $cache;
 	return 0 unless _request_cacheable($c);
@@ -565,28 +694,280 @@ sub _is_cached {
 	$c->stash->{'buffer.cache_checked'} = 1;
 
 	my $key = _cache_key($c, $options);
+	$c->stash->{'buffer.cache_key'} = $key;
+
+	my ($entry, $error) = _lookup_entry($c, $cache, $key, $state, 1);
+	return 0 if $error;
+	return _cache_miss($c, $state, $options, $key, $cache) unless $entry;
+
+	$c->app->log->debug("Buffer: cache hit for $key");
+	_replay_entry($c, $entry);
+
+	return 1;
+}
+
+# Fetch and validate an entry.  Returns (entry, error); the error flag lets
+# the initial lookup distinguish a broken cache from a miss, while waiters
+# treating either as "not there yet" can ignore it.
+sub _lookup_entry {
+	my ($c, $cache, $key, $state, $log_errors) = @_;
+
 	my $entry = eval { $cache->get($key) };
 	if (my $error = $@) {
-		$c->app->log->error("Buffer: cache get failed: $error");
-		return 0;
+		$c->app->log->error("Buffer: cache get failed: $error") if $log_errors;
+		return (undef, 1);
 	}
 
-	unless (ref($entry) eq 'HASH' && defined($entry->{body})) {
-		$c->res->headers->header('X-Cache' => 'MISS');
-		return 0;
-	}
+	return (undef, 0) unless ref($entry) eq 'HASH' && defined($entry->{body});
 
 	# An entry created before the application was last changed may have been
 	# produced by different code, so throw it away
-	my $mtime = _script_mtime($state);
+	my $mtime = _application_mtime($c, $state);
 	if (defined($mtime) && (($entry->{created} // 0) < $mtime)) {
-		$c->app->log->debug('Buffer: discarding a cache entry older than the application');
+		$c->app->log->debug('Buffer: discarding a cache entry older than the application or its templates');
 		eval { $cache->remove($key) };
-		$c->res->headers->header('X-Cache' => 'MISS');
-		return 0;
+		return (undef, 0);
 	}
 
-	$c->app->log->debug("Buffer: cache hit for $key");
+	return ($entry, 0);
+}
+
+# A miss either joins an in-flight build for the same key or becomes the
+# request that will build and store it.
+sub _cache_miss {
+	my ($c, $state, $options, $key, $cache) = @_;
+
+	$c->res->headers->header('X-Cache' => 'MISS');
+	return 0 unless $options->{cache_single_flight};
+
+	# Include the cache object so that two caches with the same key do not
+	# wait for each other
+	my $id = refaddr($cache) . "\x00$key";
+	if (my $flight = $state->{inflight}{$id}) {
+		return _join_flight($c, $state, $flight);
+	}
+
+	# With a shared lock directory, elect one worker to build the entry and
+	# make the others wait for it, even though they cannot share the flight
+	# table above.
+	my $lock;
+	if ($state->{lock_dir}) {
+		my $error;
+		($lock, $error) = _acquire_lock($state->{lock_dir}, $key);
+		if (!$lock) {
+			if (defined($error)) {
+				$c->app->log->error("Buffer: shared cache lock failed: $error");
+			} else {
+				return _join_shared_lock($c, $state, $options, $key, $cache);
+			}
+		}
+	}
+
+	_start_flight($c, $state, $id, $key, $options, $lock);
+
+	return 0;
+}
+
+sub _start_flight {
+	my ($c, $state, $id, $key, $options, $lock) = @_;
+
+	my $timeout = _lock_timeout($options);
+	my $flight = {
+		id => $id,
+		key => $key,
+		deadline => Time::HiRes::time() + $timeout,
+		waiters => {},
+		lock => $lock,
+	};
+
+	# Do not keep the key reserved for ever if the action never finishes
+	$flight->{timer} = Mojo::IOLoop->timer($timeout => sub {
+		_expire_flight($c->app, $state, $flight);
+	});
+
+	$state->{inflight}{$id} = $flight;
+	$c->stash->{'buffer.flight'} = $flight;
+	$c->app->log->debug("Buffer: this request will build the cache entry for $key");
+
+	return;
+}
+
+# Hold a second request for the same key until the first one has finished.
+# The response has to be finished later, so suppress automatic rendering.
+sub _join_flight {
+	my ($c, $state, $flight) = @_;
+
+	my $id = refaddr($c);
+	return 1 if $flight->{waiters}{$id};
+	return 1 if $c->stash->{'mojo.finished'};
+
+	$c->stash->{'buffer.cache_waiter'} = 1;
+	$c->render_later;
+
+	my $remaining = $flight->{deadline} - Time::HiRes::time();
+	$remaining = 0.05 if $remaining < 0.05;
+	$flight->{waiters}{$id} = {
+		c => $c,
+		timer => Mojo::IOLoop->timer($remaining => sub {
+			_expire_waiter($c->app, $state, $flight, $id);
+		}),
+	};
+
+	$c->app->log->debug("Buffer: waiting for the cache entry for $flight->{key}");
+
+	return 1;
+}
+
+sub _expire_waiter {
+	my ($app, $state, $flight, $id) = @_;
+
+	my $waiter = delete $flight->{waiters}{$id} or return;
+	my $c = $waiter->{c};
+	return if !$c || $c->stash->{'mojo.finished'};
+
+	$app->log->debug('Buffer: gave up waiting for another request to finish');
+	_service_unavailable($c);
+
+	return;
+}
+
+# A request in another worker holds the shared lock.  The builder cannot
+# notify us, so poll the cache until the entry appears or the lock is gone.
+sub _join_shared_lock {
+	my ($c, $state, $options, $key, $cache) = @_;
+
+	$c->stash->{'buffer.cache_waiter'} = 1;
+	$c->render_later;
+
+	my $deadline = Time::HiRes::time() + _lock_timeout($options);
+	$c->app->log->debug("Buffer: waiting for another worker to build the cache entry for $key");
+
+	my ($poll, $done);
+	$poll = Mojo::IOLoop->recurring(0.1 => sub {
+		return if $done;
+
+		if ($c->stash->{'mojo.finished'}) {
+			$done = 1;
+			Mojo::IOLoop->remove($poll);
+			return;
+		}
+
+		my ($entry) = _lookup_entry($c, $cache, $key, $state, 0);
+		if ($entry) {
+			$done = 1;
+			Mojo::IOLoop->remove($poll);
+			$c->app->log->debug('Buffer: another worker filled the cache entry');
+			_finish_waiting_request($c, $entry);
+			return;
+		}
+
+		if (Time::HiRes::time() >= $deadline) {
+			$done = 1;
+			Mojo::IOLoop->remove($poll);
+			$c->app->log->debug('Buffer: gave up waiting for another worker');
+			_finish_waiting_request($c, undef);
+			return;
+		}
+
+		# If the lock can be taken, the builder has finished.  Hold it while
+		# checking again so that a new builder cannot start in between.
+		my ($lock, $error) = _acquire_lock($state->{lock_dir}, $key);
+		if (!$lock) {
+			return unless defined($error);
+			$done = 1;
+			Mojo::IOLoop->remove($poll);
+			$c->app->log->error("Buffer: shared cache lock failed: $error");
+			_finish_waiting_request($c, undef);
+			return;
+		}
+
+		my ($late) = _lookup_entry($c, $cache, $key, $state, 0);
+		_release_lock($lock);
+		$done = 1;
+		Mojo::IOLoop->remove($poll);
+
+		if ($late) {
+			$c->app->log->debug('Buffer: another worker filled the cache entry');
+		} else {
+			$c->app->log->debug('Buffer: the other worker did not cache a response');
+		}
+		_finish_waiting_request($c, $late);
+	});
+
+	return 1;
+}
+
+sub _finish_waiting_request {
+	my ($c, $entry) = @_;
+
+	my $ok = eval {
+		if ($entry) {
+			_replay_entry($c, $entry);
+		} else {
+			_service_unavailable($c);
+		}
+		1;
+	};
+	$c->app->log->error("Buffer: could not finish a waiting request: $@") unless $ok;
+
+	return;
+}
+
+sub _expire_flight {
+	my ($app, $state, $flight) = @_;
+
+	my $current = $state->{inflight}{$flight->{id}};
+	return unless $current && refaddr($current) == refaddr($flight);
+
+	$app->log->debug('Buffer: an in-flight response did not finish in time');
+	_release_flight($app, $state, $flight, undef);
+
+	return;
+}
+
+# Finish every request waiting for this key.  With a stored entry they are
+# served it; without one (a failed or uncacheable response) they are told to
+# retry rather than each running the action, which is what single-flight is
+# meant to prevent.
+sub _release_flight {
+	my ($app, $state, $flight, $entry) = @_;
+
+	my $current = $state->{inflight}{$flight->{id}};
+	return unless $current && refaddr($current) == refaddr($flight);
+
+	delete $state->{inflight}{$flight->{id}};
+	Mojo::IOLoop->remove($flight->{timer}) if defined($flight->{timer});
+
+	my @waiters = values %{$flight->{waiters}};
+	$flight->{waiters} = {};
+
+	for my $waiter (@waiters) {
+		Mojo::IOLoop->remove($waiter->{timer}) if defined($waiter->{timer});
+		my $c = $waiter->{c};
+		next if !$c || $c->stash->{'mojo.finished'};
+
+		my $ok = eval {
+			if ($entry) {
+				$app->log->debug('Buffer: serving a waiting request from the finished response');
+				_replay_entry($c, $entry);
+			} else {
+				$app->log->debug('Buffer: the in-flight response could not be cached');
+				_service_unavailable($c);
+			}
+			1;
+		};
+		$app->log->error("Buffer: could not finish a waiting request: $@") unless $ok;
+	}
+
+	if (my $lock = delete $flight->{lock}) {
+		_release_lock($lock);
+	}
+
+	return;
+}
+
+sub _replay_entry {
+	my ($c, $entry) = @_;
 
 	$c->res->code($entry->{status} || 200);
 	my $headers = $c->res->headers;
@@ -606,6 +987,65 @@ sub _is_cached {
 	return 1;
 }
 
+sub _service_unavailable {
+	my $c = shift;
+
+	my $headers = $c->res->headers;
+	$c->res->code(503);
+	$headers->content_type('text/plain; charset=UTF-8');
+	$headers->header('Cache-Control' => 'no-store');
+	$headers->header('Retry-After' => 1);
+	$headers->header('X-Cache' => 'MISS');
+	$c->res->body("The page is being generated, please try again.\n");
+	$c->rendered;
+
+	return 1;
+}
+
+sub _lock_timeout {
+	my $options = shift;
+
+	my $timeout = $options->{cache_lock_timeout};
+	return 10 unless defined($timeout) && !ref($timeout) && $timeout =~ /^\d+(?:\.\d+)?$/ && $timeout > 0;
+
+	return $timeout + 0;
+}
+
+# Take a non-blocking flock on a file named after the cache key.  Returns a
+# guard on success, or (undef, undef) when another worker holds it.  Any
+# other failure returns (undef, error), so the caller can fall back to a
+# per-worker flight rather than breaking the request.
+sub _acquire_lock {
+	my ($dir, $key) = @_;
+
+	my $path = "$dir/" . md5_sum($key) . '.lock';
+	my $fh;
+	unless (sysopen($fh, $path, O_RDWR | O_CREAT, 0666)) {
+		return (undef, "cannot open $path: $!");
+	}
+
+	if (flock($fh, LOCK_EX | LOCK_NB)) {
+		return ({fh => $fh, path => $path}, undef);
+	}
+
+	my $error = "$!";
+	my $errno = 0 + $!;
+	close($fh);
+
+	return (undef, undef) if ($errno == EWOULDBLOCK) || ($errno == EAGAIN);
+	return (undef, "cannot lock $path: $error");
+}
+
+sub _release_lock {
+	my $lock = shift;
+
+	return unless $lock && $lock->{fh};
+	flock($lock->{fh}, LOCK_UN);
+	close(delete $lock->{fh});
+
+	return;
+}
+
 sub _store_in_cache {
 	my ($c, $options, $entity, $code) = @_;
 
@@ -615,7 +1055,7 @@ sub _store_in_cache {
 	return unless _request_cacheable($c);
 	return unless _response_cacheable($c->res, $options);
 
-	my $key = _cache_key($c, $options);
+	my $key = $c->stash->{'buffer.cache_key'} // _cache_key($c, $options);
 	my $entry = {
 		body => $entity,
 		status => 200,
@@ -632,6 +1072,9 @@ sub _store_in_cache {
 
 	$c->app->log->debug("Buffer: cached the response for $key");
 	$c->res->headers->header('X-Cache' => 'MISS') unless defined($c->res->headers->header('X-Cache'));
+
+	# Hand this entry to any request that was waiting for it
+	$c->stash->{'buffer.stored'} = $entry;
 
 	return;
 }
@@ -724,6 +1167,52 @@ sub _script_mtime {
 	return $state->{script_mtime} = @stat ? $stat[9] : undef;
 }
 
+# The newest mtime of the application and the templates.  Both Last-Modified
+# and cache invalidation use this, so a template edit invalidates a page even
+# though the application script has not changed.
+sub _application_mtime {
+	my ($c, $state) = @_;
+
+	my $key = 'buffer.application_mtime';
+	return $c->stash->{$key} if exists($c->stash->{$key});
+
+	my $latest = _script_mtime($state);
+	my %seen;
+	for my $dir (@{$c->app->renderer->paths || []}) {
+		next unless defined($dir) && length($dir);
+		$latest = _latest_mtime($dir, $latest, \%seen);
+	}
+
+	return $c->stash->{$key} = $latest;
+}
+
+# Include directory mtimes as well as file mtimes: editing a file moves the
+# file's mtime, while adding, removing or renaming one moves its directory's.
+# stat() follows symlinks, and the seen set stops a symlink loop.
+sub _latest_mtime {
+	my ($path, $latest, $seen) = @_;
+
+	my @stat = stat($path);
+	return $latest unless @stat;
+
+	if (defined($stat[9]) && (!defined($latest) || ($stat[9] > $latest))) {
+		$latest = $stat[9];
+	}
+	return $latest unless -d _;
+
+	my $id = "$stat[0]:$stat[1]";
+	return $latest if $seen->{$id}++;
+
+	opendir(my $dh, $path) or return $latest;
+	for my $entry (readdir $dh) {
+		next if ($entry eq '.') || ($entry eq '..');
+		$latest = _latest_mtime(File::Spec->catfile($path, $entry), $latest, $seen);
+	}
+	closedir($dh);
+
+	return $latest;
+}
+
 sub _optimise {
 	my ($self, $body, $c, $options) = @_;
 
@@ -736,6 +1225,10 @@ sub _optimise {
 		my $rewritten = _rewrite_links($body, $c);
 		$body = $rewritten if defined($rewritten);
 	}
+
+	# Without HTML::Packer comments and embedded CSS/JavaScript cannot be
+	# minified, but the white-space squashing above is still worth keeping
+	return $body unless _module_available('HTML::Packer');
 
 	my $minified = eval {
 		require HTML::Packer;
@@ -955,7 +1448,7 @@ sub _resolve_last_modified {
 	return undef if ref $option;
 
 	if ($option eq '1') {
-		return _script_mtime($state);
+		return _application_mtime($c, $state);
 	}
 
 	return $option + 0 if $option =~ /^\d+$/;
@@ -1073,11 +1566,15 @@ its own set of entries and anonymous visitors share them.  Sites that set an
 analytics cookie on every visit will get little sharing; use
 C<vary_by =E<gt> []> for genuinely public pages, or L</cache_key>.
 
-=item * There is no stampede protection.  Concurrent misses all run the
-action and all write the same entry; CHI does not lock.
+=item * Single-flight is per worker by default.  Each C<hypnotoad> worker
+keeps its own in-flight table, so a cold entry can be built once per worker;
+set L</cache_lock_dir> to coalesce across workers, with a shared cache.  A
+request waiting on an in-flight response is answered with C<503> if that
+response fails, cannot be cached, or exceeds L</cache_lock_timeout>, rather
+than running the action a second time.
 
-=item * Entries are invalidated when the application script's modification
-time changes, but not when data or configuration changes.  The TTL is the
+=item * Entries are invalidated when the application script or a template
+path changes, but not when data or configuration changes.  The TTL is the
 backstop for those.
 
 =back

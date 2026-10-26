@@ -60,6 +60,12 @@ subtest 'options are validated' => sub {
 
 	eval { Mojolicious->new->plugin('Buffer', compressible_types => 'text/html') };
 	like($@, qr/compressible_types must be an array reference/, 'types must be an arrayref');
+
+	eval { Mojolicious->new->plugin('Buffer', cache_lock_timeout => 0) };
+	like($@, qr/cache_lock_timeout must be a positive number/, 'the lock timeout must be positive');
+
+	eval { Mojolicious->new->plugin('Buffer', cache_lock_timeout => 'soon') };
+	like($@, qr/cache_lock_timeout must be a positive number/, 'the lock timeout must be a number');
 };
 
 subtest 'multibyte bodies get a byte length' => sub {

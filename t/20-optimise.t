@@ -5,8 +5,7 @@ use Test::More;
 use Mojolicious;
 use Test::Mojo;
 
-eval { require HTML::Packer; 1 }
-	or plan skip_all => 'HTML::Packer is required to test optimisation';
+my $HAVE_PACKER = eval { require HTML::Packer; 1 } ? 1 : 0;
 
 my $HTML = <<'HTML';
 <html>
@@ -67,7 +66,11 @@ subtest 'HTML is optimised' => sub {
 
 	my $body = $t->tx->res->body;
 	cmp_ok(length($body), '<', length($HTML), 'body is smaller than the original');
-	unlike($body, qr/remove this comment/, 'comments are removed');
+	if ($HAVE_PACKER) {
+		unlike($body, qr/remove this comment/, 'comments are removed');
+	} else {
+		like($body, qr/remove this comment/, 'comments are kept without HTML::Packer');
+	}
 	unlike($body, qr/\n\s*\n/, 'blank lines are removed');
 	like($body, qr{<a href="/page">}, 'absolute link to this site became root-relative');
 	like($body, qr{<a href="/search\?q=perl">}, 'absolute link with a query became root-relative');

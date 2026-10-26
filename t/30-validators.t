@@ -63,6 +63,13 @@ subtest 'generate_etag can be turned off' => sub {
 	$no_etag->get_ok('/')->status_is(200);
 	ok(!defined($no_etag->tx->res->headers->etag), 'no ETag');
 	$no_etag->get_ok('/' => {'If-None-Match' => $identity_etag})->status_is(200);
+
+	# Last-Modified still answers If-Modified-Since, but If-None-Match wins
+	my $lm = Mojo::Date->new((stat($0))[9])->to_string;
+	$no_etag->get_ok('/')->status_is(200);
+	$no_etag->header_is('Last-Modified' => $lm);
+	$no_etag->get_ok('/' => {'If-Modified-Since' => $lm})->status_is(304);
+	$no_etag->get_ok('/' => {'If-Modified-Since' => $lm, 'If-None-Match' => '"anything"'})->status_is(200);
 };
 
 subtest 'generate_304 can be turned off' => sub {
@@ -93,10 +100,29 @@ subtest 'Last-Modified' => sub {
 		'If-None-Match' => $identity_etag})->status_is(304);
 };
 
-subtest 'Last-Modified is off by default' => sub {
+subtest 'Last-Modified is on by default' => sub {
+	my $modified = (stat($0))[9];
+	my $lm = Mojo::Date->new($modified)->to_string;
+
 	$t->get_ok('/')->status_is(200);
-	ok(!defined($t->tx->res->headers->last_modified), 'no Last-Modified header');
-	$t->get_ok('/' => {'If-Modified-Since' => Mojo::Date->new(time + 3600)->to_string})->status_is(200);
+	$t->header_is('Last-Modified' => $lm);
+
+	$t->get_ok('/' => {'If-Modified-Since' => $lm})->status_is(304);
+	$t->get_ok('/' => {'If-Modified-Since' => Mojo::Date->new($modified - 3600)->to_string})->status_is(200);
+	$t->get_ok('/' => {'If-Modified-Since' => 'not a date'})->status_is(200);
+
+	# The ETag still takes precedence over a matching If-Modified-Since
+	$t->get_ok('/' => {'If-Modified-Since' => $lm, 'If-None-Match' => '"wrong"'})->status_is(200);
+	$t->get_ok('/' => {'If-Modified-Since' => Mojo::Date->new($modified - 3600)->to_string,
+		'If-None-Match' => $identity_etag})->status_is(304);
+};
+
+subtest 'Last-Modified can be turned off' => sub {
+	my $off = Test::Mojo->new(build_app(last_modified => 0));
+	$off->ua->transactor->compressed(0);
+	$off->get_ok('/')->status_is(200);
+	ok(!defined($off->tx->res->headers->last_modified), 'no Last-Modified header');
+	$off->get_ok('/' => {'If-Modified-Since' => Mojo::Date->new(time + 3600)->to_string})->status_is(200);
 };
 
 subtest 'conditional requests are only for successful GET and HEAD' => sub {

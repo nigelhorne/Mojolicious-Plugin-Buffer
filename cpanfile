@@ -8,7 +8,9 @@ recommends 'HTML::Packer';
 recommends 'IO::Compress::Brotli';
 
 on 'test' => sub {
+	requires 'Mojo::Base';
 	requires 'Test::More';
+	requires 'Test::Without::Module';
 };
 
 on 'develop' => sub {

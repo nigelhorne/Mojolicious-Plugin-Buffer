@@ -4,7 +4,7 @@ Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious respon
 
 # VERSION
 
-Version 0.02
+Version 0.07
 
 # SYNOPSIS
 
@@ -109,14 +109,17 @@ clients are controlled by ["encodings"](#encodings).
 How hard to optimise HTML, defaults to 0 (off):
 
 - 0 - leave the HTML alone
-- 1 - remove comments and superfluous white space, minify embedded CSS,
-and rewrite same-site links
-- 2 - as 1, plus aggressive JavaScript minification, which can break
-scripts that rely on the `<!-- ... -->` hiding technique
+- 1 - remove superfluous white space, rewrite same-site links and, when
+[HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) is installed, remove comments and minify embedded CSS
+- 2 - as 1, plus aggressive JavaScript minification when [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker)
+is installed, which can break scripts that rely on the
+`<!-- ... -->` hiding technique
 
 Optimisation only applies to `text/html` and `application/xhtml+xml`
-responses.  It requires [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker), which is checked for when the
-plugin is registered.
+responses.  [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) is optional: without it the white-space
+squashing and link rewriting still run, but comments and embedded CSS and
+JavaScript are left alone, as they are by [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and
+[FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  Install [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) for the full effect.
 
 ## rewrite\_links
 
@@ -135,16 +138,20 @@ representation of the same page have different tags.
 ## generate\_304
 
 Answer conditional requests with `304 Not Modified` when the
-`If-None-Match` (or, failing that, `If-Modified-Since`) header matches,
-defaults to 1.  Requires ["generate\_etag"](#generate_etag) for the `ETag` comparison.
+`If-None-Match` (or, when it is absent, `If-Modified-Since`) header
+matches, defaults to 1.  `If-None-Match` takes precedence over
+`If-Modified-Since`, as required by RFC 7232.  Requires ["generate\_etag"](#generate_etag)
+for the `ETag` comparison.
 
 ## last\_modified
 
-Add a `Last-Modified` header and honour `If-Modified-Since`, defaults to 0
-(off).  May be:
+Add a `Last-Modified` header and honour `If-Modified-Since`, defaults to 1,
+which uses the newest modification time of the application script (`$0`)
+and the renderer's template files and directories.  May be:
 
 - 0 - do not generate the header
-- 1 - use the modification time of the application script (`$0`)
+- 1 - use the newest modification time of the application script (`$0`) and
+  the files and directories under the renderer's template paths
 - a number - a Unix epoch
 - a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can parse
 - a coderef - called with the controller, returns any of the above
@@ -152,6 +159,17 @@ Add a `Last-Modified` header and honour `If-Modified-Since`, defaults to 0
 The value is ignored for responses that are not `200` responses to
 `GET` or `HEAD` requests.  If `If-None-Match` is present it takes
 precedence over `If-Modified-Since`, as required by RFC 7232.
+
+The default is the newest mtime of the application file and the files and
+directories under the renderer's `paths`, so editing a template changes
+`Last-Modified` and discards cache entries built from the old one.  `morbo`
+and `hypnotoad` set `$0` to your application script, but under a PSGI or
+module-only deployment it may be the wrapper instead; pass an explicit epoch
+or a coderef there.  The template paths are scanned once per request, so for
+a large tree or an application that does not use templates, an explicit
+epoch or coderef is cheaper.  Database rows and other inputs are not
+covered; use a coderef for pages whose freshness depends on them, or set
+`last_modified => 0` and rely on ["generate\_etag"](#generate_etag) alone.
 
 ## min\_compress\_size
 
@@ -198,6 +216,53 @@ A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
 when the response depends on something the default key does not cover.
 
+## cache\_single\_flight
+
+Only let one request at a time build a missing entry, defaults to 1.  When a
+request misses the cache while another request in the same worker is already
+building the same key, the second request waits for the first one to finish
+and is then served the finished entry, without running the action.  This
+matters for asynchronous actions: a synchronous action runs to completion
+without the event loop doing anything else, so it cannot overlap with
+another request in the same worker.
+
+If the first request fails, produces a response that cannot be cached (for
+example one that sets a cookie), or takes longer than ["cache\_lock\_timeout"](#cache_lock_timeout),
+the waiting request is answered with `503 Service Unavailable` and
+`Retry-After: 1` rather than running the action itself.  Set to 0 to let
+every concurrent miss run the action independently.
+
+By default the in-flight table is per worker process, so with N [hypnotoad](https://metacpan.org/pod/hypnotoad)
+workers a cold entry can still be built up to N times.  Set
+["cache\_lock\_dir"](#cache_lock_dir) to a directory shared by the workers and they will elect a
+single builder across processes instead.
+
+## cache\_lock\_timeout
+
+How long a request may wait for another request, in this worker or another
+one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
+long a key is considered to be in flight when the request building it never
+finishes.  Fractional seconds are allowed, so `0.5` is valid.
+
+## cache\_lock\_dir
+
+A directory in which to keep lock files used to coalesce cache misses across
+worker processes, defaults to undef, which limits single-flight to one worker.
+The plugin creates the directory if necessary.
+
+The workers must share this directory and the cache itself.  A per-worker
+cache such as CHI's `Memory` driver cannot be used, because a request in one
+worker cannot see the entry built in another; disable any per-worker `L1`
+cache in front of a shared cache for the same reason.  Locks are non-blocking
+`flock`s on one small, empty file per cache key, so they are released
+automatically if a worker dies.  The files are not removed, although they are
+tiny and can be deleted while the application is stopped.  Use a private
+directory.
+
+This works for [hypnotoad](https://metacpan.org/pod/hypnotoad) workers on the same host, or on a shared
+filesystem that implements `flock` reliably.  It is read when the plugin is
+registered, not per response.
+
 ## vary\_by
 
 An arrayref of request header names that become part of the generated cache
@@ -240,8 +305,8 @@ with an `Authorization` header or a `Cache-Control` header containing
 requests made while the `NO_CACHE` or `NO_STORE` environment variable is
 set.  Responses that set a cookie, that are marked `no-store` or
 `private`, or that vary on something not listed in ["vary\_by"](#vary_by), are not
-stored.  Entries created before the application script was last modified
-are treated as misses and removed.
+stored.  Entries created before the application script or any template file
+or directory was last modified are treated as misses and removed.
 
 The stored body is the optimised but uncompressed entity, so every hit is
 compressed for the requesting client, gets its own `ETag` and can still be
@@ -249,6 +314,13 @@ answered with `304 Not Modified`.  The cache key is a digest of the
 application class, host, path, query string and the values of the headers
 listed in ["vary\_by"](#vary_by); use ["cache\_key"](#cache_key) to replace it.  Query argument order
 is significant.
+
+Concurrent misses for the same key are coalesced within a worker, or across
+workers when ["cache\_lock\_dir"](#cache_lock_dir) is set: while one request is building an
+entry, later requests wait for it and replay the result instead of running
+the action again.  The waiting requests are held asynchronously, so this
+works for actions that themselves use the event loop.  See
+["cache\_single\_flight"](#cache_single_flight) for the failure and timeout behaviour.
 
 Calling the helper more than once is harmless, but only the first call can
 hit.  To disable the cache for one response, use
@@ -310,10 +382,14 @@ cached, and an action that calls it for a personalised page must supply a
 its own set of entries and anonymous visitors share them.  Sites that set an
 analytics cookie on every visit will get little sharing; use
 `vary_by => []` for genuinely public pages, or ["cache\_key"](#cache_key).
-- There is no stampede protection.  Concurrent misses all run the
-action and all write the same entry; CHI does not lock.
-- Entries are invalidated when the application script's modification
-time changes, but not when data or configuration changes.  The TTL is the
+- Single-flight is per worker by default.  Each `hypnotoad` worker
+keeps its own in-flight table, so a cold entry can be built once per worker;
+set ["cache\_lock\_dir"](#cache_lock_dir) to coalesce across workers, with a shared cache.  A
+request waiting on an in-flight response is answered with `503` if that
+response fails, cannot be cached, or exceeds ["cache\_lock\_timeout"](#cache_lock_timeout), rather
+than running the action a second time.
+- Entries are invalidated when the application script or a template
+path changes, but not when data or configuration changes.  The TTL is the
 backstop for those.
 
 # SEE ALSO

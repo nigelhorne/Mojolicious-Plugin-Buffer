@@ -4,8 +4,7 @@ use warnings;
 use Test::More;
 use Mojolicious::Lite;
 
-eval { require HTML::Packer; 1 }
-	or plan skip_all => 'HTML::Packer is required to test optimisation';
+my $HAVE_PACKER = eval { require HTML::Packer; 1 } ? 1 : 0;
 
 plugin 'Buffer' => {optimise_content => 1};
 
@@ -21,7 +20,11 @@ $t->ua->transactor->compressed(0);
 $t->get_ok('/')->status_is(200);
 
 my $body = $t->tx->res->body;
-unlike($body, qr/a comment/, 'the plugin was loaded by name and optimised the response');
+if ($HAVE_PACKER) {
+	unlike($body, qr/a comment/, 'the plugin was loaded by name and optimised the response');
+} else {
+	like($body, qr/a comment/, 'comments are kept without HTML::Packer');
+}
 like($body, qr/<p>Hello World<\/p>/, 'white space was squashed');
 
 done_testing();
