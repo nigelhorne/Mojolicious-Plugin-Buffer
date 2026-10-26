@@ -8,21 +8,46 @@ Revision history for Mojolicious-Plugin-Buffer
 	including level 2 coverage.
 	Test added, deleted and symlinked template directories, covering
 	directory mtimes and symlink-loop protection.
+	Assert that adding or deleting a template directory also invalidates the
+	cached response, and pin the cache key in the invalidation tests so a
+	fresh Test::Mojo port cannot force the miss by itself.
+	Test the response cache and the template mtime cache together: a page
+	stays cached while the mtime entry is in date, and is discarded once it
+	expires and the scan sees a newer tree.
 	Add template_mtime_cache and template_mtime_cache_duration so the
 	template tree scan can be cached, including across workers.
 	Test cache hits, expiry, scan fallback and option validation.
-	Benchmark the default template mtime scan against an explicit epoch
-	on a 10,000-template tree and document the trade-off.
+	Benchmark the default template mtime scan against an explicit epoch and
+	a cached scan on a 10,000-template tree, and document the trade-off.
 	Test a hypnotoad waiter receiving 503 when another worker holds the
-	shared lock past cache_lock_timeout.
+	shared lock past cache_lock_timeout, and assert from the worker log that
+	the builder and the waiter ran on different workers.
 	Test that a hypnotoad worker killed while holding the shared lock
 	releases it for the remaining workers.
+	Test that an action failing while holding the shared lock gives its
+	waiter a 503 and that the lock is still released afterwards.
 	Assert that the concurrent cold requests used more than one worker
-	pid, so cross-worker locking is actually exercised.
-	Add a runnable hypnotoad example under eg/hypnotoad.
+	pid, so cross-worker locking is actually exercised; retry the batch
+	with a fresh cache key when the pool hands every connection to one
+	worker, so the assertion tests the plugin and not the scheduler, and
+	report the attempt that worked on STDERR so retries show up in CI logs.
+	Add a runnable hypnotoad example under eg/hypnotoad, and a smoke test
+	that starts it on an ephemeral port and checks a MISS followed by a HIT.
 	Add an optional live Redis integration test, skipped unless
-	MPB_REDIS_URL or REDIS_URL is configured.
+	MPB_REDIS_URL or REDIS_SERVER is configured, with Redis::Fast accepted as
+	an alternative to Redis.
+	Exercise the Redis lock crash path with three processes: a killed
+	holder, a blocked waiter and a takeover once the TTL expires, with the
+	TTL configurable through MPB_REDIS_TTL and generous socket timeouts so
+	a loaded machine cannot fail it.
 	Audit the concurrency tests for completion-order assumptions: release
 	the shared lock only once the waiter has joined, for the file, Redis and
 	cross-process backends, and flush the cross-process handshake so a
 	waiting request is not served from an entry filled before it arrived.
+	Only answer 304 from If-Modified-Since when no ETag is generated, so a
+	page whose data changed under an unchanged template is not revalidated
+	from the template timestamp, and add trust_last_modified to opt back in
+	for pages that only render templates.
+	Let trust_last_modified be declared for a group of pages, as a route
+	default (including an under route) or a controller declaration, so a
+	whole namespace opts in once instead of repeating the stash.

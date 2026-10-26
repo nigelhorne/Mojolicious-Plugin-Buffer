@@ -10,7 +10,7 @@ use Test::Mojo;
 {
 	package TestCache;
 
-	sub new { bless {data => {}, sets => 0, gets => 0, durations => []}, shift }
+	sub new { bless {data => {}, sets => 0, gets => 0, removes => 0, durations => []}, shift }
 
 	sub get {
 		my ($self, $key) = @_;
@@ -29,6 +29,7 @@ use Test::Mojo;
 	sub remove {
 		my ($self, $key) = @_;
 		delete $self->{data}{$key};
+		$self->{removes}++;
 		return 1;
 	}
 }
@@ -103,7 +104,7 @@ subtest 'the default Last-Modified follows template changes' => sub {
 	my $lm = $t->tx->res->headers->last_modified;
 	is($lm, Mojo::Date->new($first)->to_string, 'the newest template mtime is used');
 	like($t->tx->res->body, qr/first/, 'the template was rendered');
-	$t->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(304);
+	$t->get_ok('/template' => {'If-None-Match' => $t->tx->res->headers->etag})->status_is(304);
 
 	write_template($template, 'second', $second);
 
@@ -114,7 +115,7 @@ subtest 'the default Last-Modified follows template changes' => sub {
 	is($t2->tx->res->headers->last_modified, Mojo::Date->new($second)->to_string,
 		'the edited template moved Last-Modified');
 	like($t2->tx->res->body, qr/second/, 'the edited template was rendered');
-	$t2->get_ok('/template' => {'If-Modified-Since' => Mojo::Date->new($second)->to_string})->status_is(304);
+	$t2->get_ok('/template' => {'If-None-Match' => $t2->tx->res->headers->etag})->status_is(304);
 };
 
 subtest 'adding a template directory moves Last-Modified' => sub {
@@ -134,7 +135,7 @@ subtest 'adding a template directory moves Last-Modified' => sub {
 	$t->get_ok('/template')->status_is(200);
 	my $lm = $t->tx->res->headers->last_modified;
 	is($lm, Mojo::Date->new($first)->to_string, 'the initial validator comes from the template');
-	$t->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(304);
+	$t->get_ok('/template' => {'If-None-Match' => $t->tx->res->headers->etag})->status_is(304);
 
 	my $sub = "$dir/sub";
 	mkdir($sub) or die "Cannot create $sub: $!";
@@ -185,6 +186,106 @@ subtest 'deleting a template directory moves Last-Modified' => sub {
 	$t2->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(200);
 	is($t2->tx->res->headers->last_modified, Mojo::Date->new($removed)->to_string,
 		'the deletion moved Last-Modified');
+};
+
+subtest 'adding a template directory invalidates the cached response' => sub {
+	my $dir = File::Temp->newdir('mpb-template-add-cache-XXXXXX', TMPDIR => 1);
+	my $template = "$dir/page.html.ep";
+	my $fake_script = "$dir/app.pl";
+	my $first = 2_000;
+	my $added = $first + 120;
+	write_file($fake_script, "1;\n", 1_000);
+	write_template($template, 'first', $first);
+	set_mtime($dir, 900);
+
+	local $0 = $fake_script;
+
+	# A fixed cache key keeps the entry reachable from a second application,
+	# which Test::Mojo would otherwise give a different port and so a different
+	# generated key
+	my $cache = TestCache->new;
+	my %plugin = (cache => $cache, cache_key => 'template-page');
+	my $t = Test::Mojo->new(build_app($dir, %plugin));
+	$t->ua->transactor->compressed(0);
+
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'MISS');
+	my $lm = $t->tx->res->headers->last_modified;
+	is($lm, Mojo::Date->new($first)->to_string, 'the cached response used the template mtime');
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+	is($cache->{sets}, 1, 'the first response was stored');
+
+	# A fresh application replays that entry, so the miss below cannot just be
+	# a different key
+	my $t2 = Test::Mojo->new(build_app($dir, %plugin));
+	$t2->ua->transactor->compressed(0);
+	$t2->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+
+	# Model an entry built before the templates changed, then add a directory
+	# that is newer than it
+	$_->{created} = 1_500 for values %{$cache->{data}};
+
+	my $sub = "$dir/sub";
+	mkdir($sub) or die "Cannot create $sub: $!";
+	write_template("$sub/extra.html.ep", 'extra', $first);
+	set_mtime($sub, $added);
+	set_mtime($dir, $added);
+
+	# The renderer has not cached the page, so the action really renders again
+	$t2->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(200)
+		->header_is('X-Cache' => 'MISS');
+	is($cache->{removes}, 1, 'the entry built before the new directory was discarded');
+	is($t2->tx->res->headers->last_modified, Mojo::Date->new($added)->to_string,
+		'the new directory moved Last-Modified');
+	like($t2->tx->res->body, qr/first/, 'the rebuilt response contains the page');
+	is($cache->{sets}, 2, 'the new response was stored');
+};
+
+subtest 'deleting a template directory invalidates the cached response' => sub {
+	my $dir = File::Temp->newdir('mpb-template-del-cache-XXXXXX', TMPDIR => 1);
+	my $template = "$dir/page.html.ep";
+	my $fake_script = "$dir/app.pl";
+	my $first = 2_000;
+	my $sub_mtime = $first + 100;
+	my $removed = $first + 220;
+	write_file($fake_script, "1;\n", 1_000);
+	write_template($template, 'first', $first);
+
+	my $sub = "$dir/sub";
+	mkdir($sub) or die "Cannot create $sub: $!";
+	write_template("$sub/extra.html.ep", 'extra', $sub_mtime);
+	set_mtime($sub, $sub_mtime);
+	set_mtime($dir, 900);
+
+	local $0 = $fake_script;
+
+	my $cache = TestCache->new;
+	my %plugin = (cache => $cache, cache_key => 'template-page');
+	my $t = Test::Mojo->new(build_app($dir, %plugin));
+	$t->ua->transactor->compressed(0);
+
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'MISS');
+	my $lm = $t->tx->res->headers->last_modified;
+	is($lm, Mojo::Date->new($sub_mtime)->to_string, 'the directory was part of the cached validator');
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+	is($cache->{sets}, 1, 'the first response was stored');
+
+	my $t2 = Test::Mojo->new(build_app($dir, %plugin));
+	$t2->ua->transactor->compressed(0);
+	$t2->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+
+	$_->{created} = 1_500 for values %{$cache->{data}};
+
+	unlink("$sub/extra.html.ep") or die "Cannot remove the extra template: $!";
+	rmdir($sub) or die "Cannot remove $sub: $!";
+	set_mtime($dir, $removed);
+
+	$t2->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(200)
+		->header_is('X-Cache' => 'MISS');
+	is($cache->{removes}, 1, 'the entry built before the deletion was discarded');
+	is($t2->tx->res->headers->last_modified, Mojo::Date->new($removed)->to_string,
+		'the deletion moved Last-Modified');
+	like($t2->tx->res->body, qr/first/, 'the rebuilt response contains the page');
+	is($cache->{sets}, 2, 'the new response was stored');
 };
 
 subtest 'symlinked template directories are followed without looping' => sub {
@@ -275,6 +376,65 @@ subtest 'the template mtime scan can be cached' => sub {
 		'a cache miss scans again and sees the edited template');
 	is($cache->{gets}, 3, 'the miss was looked up');
 	is($cache->{sets}, 2, 'the new scan was cached');
+};
+
+subtest 'an expired template mtime entry lets a stale page be discarded' => sub {
+	my $dir = File::Temp->newdir('mpb-template-both-caches-XXXXXX', TMPDIR => 1);
+	my $template = "$dir/page.html.ep";
+	my $fake_script = "$dir/app.pl";
+	my $first = 2_000;
+	my $added = $first + 120;
+	write_file($fake_script, "1;\n", 1_000);
+	write_template($template, 'first', $first);
+	set_mtime($dir, 900);
+
+	local $0 = $fake_script;
+
+	my $pages  = TestCache->new;
+	my $mtimes = TestCache->new;
+	my $t = Test::Mojo->new(build_app($dir,
+		cache => $pages,
+		cache_key => 'template-page',
+		template_mtime_cache => $mtimes,
+		template_mtime_cache_duration => 60,
+	));
+	$t->ua->transactor->compressed(0);
+
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'MISS');
+	my $lm = $t->tx->res->headers->last_modified;
+	is($lm, Mojo::Date->new($first)->to_string, 'the page and the scan use the template mtime');
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+	is($pages->{sets}, 1, 'the page was cached once');
+	is($mtimes->{sets}, 1, 'the scan was cached once');
+
+	# A page built while the newest mtime was $first, which is what the mtime
+	# cache still holds.  An entry older than the cached mtime stays valid;
+	# the added directory below is newer than both.
+	$_->{created} = $first + 100 for values %{$pages->{data}};
+
+	my $sub = "$dir/sub";
+	mkdir($sub) or die "Cannot create $sub: $!";
+	write_template("$sub/extra.html.ep", 'extra', $first);
+	set_mtime($sub, $added);
+	set_mtime($dir, $added);
+
+	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'HIT');
+	is($t->tx->res->headers->last_modified, $lm, 'the cached scan still hides the change');
+	is($pages->{removes}, 0, 'the page was not discarded while the cached mtime was in date');
+	is($mtimes->{sets}, 1, 'the scan was not repeated');
+
+	# Model the mtime entry expiring while the page entry survives
+	my ($mtime_key) = keys %{$mtimes->{data}};
+	ok(defined($mtime_key), 'the scan was stored under a key') or return;
+	delete $mtimes->{data}{$mtime_key};
+
+	$t->get_ok('/template' => {'If-Modified-Since' => $lm})->status_is(200)
+		->header_is('X-Cache' => 'MISS');
+	is($pages->{removes}, 1, 'the expired mtime entry let the stale page be discarded');
+	is($t->tx->res->headers->last_modified, Mojo::Date->new($added)->to_string,
+		'the fresh scan moved Last-Modified');
+	is($mtimes->{sets}, 2, 'the fresh scan was cached');
+	is($pages->{sets}, 2, 'the rebuilt page was cached');
 };
 
 subtest 'a CHI cache can hold the template mtime' => sub {
@@ -376,8 +536,12 @@ subtest 'a template change invalidates the cached response' => sub {
 	# template-aware check can discard the entry below.
 	local $0 = $fake_script;
 
+	# A fixed cache key keeps the entry reachable from the second application;
+	# otherwise the different Test::Mojo port alone would force a miss and the
+	# invalidation would go untested
 	my $cache = TestCache->new;
-	my $t = Test::Mojo->new(build_app($dir, cache => $cache));
+	my %plugin = (cache => $cache, cache_key => 'template-page');
+	my $t = Test::Mojo->new(build_app($dir, %plugin));
 	$t->ua->transactor->compressed(0);
 
 	$t->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'MISS');
@@ -390,9 +554,10 @@ subtest 'a template change invalidates the cached response' => sub {
 
 	write_template($template, 'second', 2_000);
 
-	my $t2 = Test::Mojo->new(build_app($dir, cache => $cache));
+	my $t2 = Test::Mojo->new(build_app($dir, %plugin));
 	$t2->ua->transactor->compressed(0);
 	$t2->get_ok('/template')->status_is(200)->header_is('X-Cache' => 'MISS');
+	is($cache->{removes}, 1, 'the entry built before the edit was discarded');
 	like($t2->tx->res->body, qr/second/, 'the edited template replaced the cached body');
 	is($cache->{sets}, 2, 'the new response was stored');
 };

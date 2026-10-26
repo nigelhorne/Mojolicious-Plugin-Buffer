@@ -47,3 +47,9 @@ When stopping a server that used these overrides, pass the same
 The lock backend requires a shared filesystem with working `flock`. For
 workers on different hosts, use the Redis lock backend described in the
 main documentation instead.
+
+## Testing
+
+`t/85-example.t` starts this example under hypnotoad on an unused port and
+checks the MISS then HIT sequence, so the instructions above are exercised by
+the test suite. It skips when hypnotoad or CHI is not installed.

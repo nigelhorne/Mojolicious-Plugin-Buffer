@@ -36,6 +36,7 @@ my %DEFAULTS = (
 	rewrite_links      => 1,	# make same-site absolute links relative
 	generate_etag      => 1,
 	generate_304       => 1,
+	trust_last_modified => 0,	# also answer If-Modified-Since when an ETag exists
 	last_modified      => 1,	# 0 = off, 1 = newest app/template mtime, epoch, date string or coderef
 	template_mtime_cache => undef,	# cache object for the template mtime scan
 	template_mtime_cache_duration => 10,	# seconds to keep a cached template mtime
@@ -140,8 +141,8 @@ site with relative links;
 the client prefers and the server supports;
 
 =item * adds C<ETag>, C<Last-Modified> and C<Vary> headers, and answers
-C<If-None-Match> and C<If-Modified-Since> conditional requests with
-C<304 Not Modified>;
+C<If-None-Match> conditional requests, or C<If-Modified-Since> when no
+C<ETag> is generated, with C<304 Not Modified>;
 
 =item * sets an accurate C<Content-Length> after the above changes;
 
@@ -211,16 +212,26 @@ representation of the same page have different tags.
 =head2 generate_304
 
 Answer conditional requests with C<304 Not Modified> when the
-C<If-None-Match> (or, when it is absent, C<If-Modified-Since>) header
-matches, defaults to 1.  C<If-None-Match> takes precedence over
-C<If-Modified-Since>, as required by RFC 7232.  Requires L</generate_etag>
-for the C<ETag> comparison.
+C<If-None-Match> header matches, defaults to 1.  C<If-None-Match> takes
+precedence over C<If-Modified-Since>, as required by RFC 7232.
+
+C<If-Modified-Since> is only used when no C<ETag> is generated for the
+response, which means L</generate_etag> is off, unless L</trust_last_modified>
+opts back in.  C<Last-Modified> is derived from the application and its
+templates, and says nothing about the data a page was rendered from: a
+database row or a stash value can change while the template stays untouched.
+A 304 on the timestamp alone would tell such a client that its stale copy is
+current, so with an C<ETag> available only the tag can revalidate the
+response.  Clients that have the tag, which includes browsers after the first
+C<200>, send C<If-None-Match> and are unaffected.
 
 =head2 last_modified
 
-Add a C<Last-Modified> header and honour C<If-Modified-Since>, defaults to 1,
-which uses the newest modification time of the application script (C<$0>)
-and the renderer's template files and directories.  May be:
+Add a C<Last-Modified> header, and honour C<If-Modified-Since> when no
+C<ETag> is generated (see L</generate_304>) or L</trust_last_modified> is
+set, defaults to 1, which uses the newest modification time of the
+application script (C<$0>) and the renderer's template files and directories.
+May be:
 
 =over 4
 
@@ -251,7 +262,60 @@ L</template_mtime_cache> is configured, so for a large tree or an application
 that does not use templates, an explicit epoch or coderef is cheaper.
 Database rows and other inputs are not covered; use a coderef for pages whose
 freshness depends on them, or set C<last_modified =E<gt> 0> and rely on
-L</generate_etag> alone.
+L</generate_etag> alone.  A page whose data changes without its template
+changing is never answered with a 304 from this timestamp while an C<ETag> is
+generated, but the header itself still only describes the code, so a client
+that keeps C<If-Modified-Since> without the tag will keep refetching it.
+
+=head2 trust_last_modified
+
+Answer C<If-Modified-Since> even when an C<ETag> is generated, defaults to 0.
+Only enable it for pages whose body is a function of the application and its
+templates, with no database rows, session values or other inputs that can
+change under an untouched template.
+
+L</last_modified> describes the code, not the body, which is why
+C<If-Modified-Since> is otherwise ignored while a tag exists.  Turning this
+on restores timestamp revalidation for clients that send only
+C<If-Modified-Since>, so a page rendered from its templates alone can be
+revalidated by those clients without a tag.  C<If-None-Match> still takes
+precedence, so a client holding the tag is still protected from a stale copy
+even here:
+
+    plugin 'Buffer' => {
+	trust_last_modified => 1,   # this application only renders templates
+    };
+
+Use it per response instead with C<< $c->stash(buffer => {trust_last_modified
+=> 1}) >> when only some pages are that predictable.
+
+A whole group of pages can opt in once.  The easiest way is a route default,
+which L<Mojolicious> copies into the stash:
+
+    # one route
+    $r->get('/about' => {trust_last_modified => 1} => sub {...});
+
+    # everything beneath an under route
+    my $docs = $r->under('/docs')->to(trust_last_modified => 1);
+    $docs->get('/intro' => sub {...});
+
+A controller can declare it for itself and, through a base class, for its
+whole namespace:
+
+    package MyApp::Controller::Docs;
+    use Mojo::Base 'Mojolicious::Controller';
+    has buffer_trust_last_modified => 1;
+
+    sub intro { shift->render(template => 'docs/intro') }
+
+A plain C<sub buffer_trust_last_modified { 1 }> works too, for a value that
+depends on something the controller knows at request time.
+
+A route default wins over the controller declaration, so a route default of
+C<0> opts one page back out of a trusting namespace, and the C<buffer> stash
+overrides both.  The declaration has no effect when L</generate_304> is off,
+and it cannot make a page safe: it only says that the application and its
+templates really are the only inputs.
 
 =head2 Last-Modified performance
 
@@ -259,10 +323,13 @@ The scan costs one C<stat()> per file and directory under the renderer's
 paths.  On a tree of 10,000 templates in 100 directories, a request using the
 default scan took about 40 milliseconds of CPU on the machine used for these
 measurements, against about 1 millisecond for the same request with an
-explicit epoch; that is roughly 4 microseconds per tree entry.  The numbers
-are indicative, not a promise, and a faster or slower filesystem will move
-them.  Run F<benchmarks/last_modified.pl> with your own tree size to measure
-it.
+explicit epoch; that is roughly 4 microseconds per tree entry.  With
+L</template_mtime_cache> in front of it, the same request also took about 1
+millisecond, the cache lookup adding only a few tens of microseconds, so the
+middle ground gives up roughly 2% of the scan's cost to keep template
+awareness.  The numbers are indicative, not a promise, and a faster or slower
+filesystem will move them.  Run F<benchmarks/last_modified.pl> with your own
+tree size to measure all three variants.
 
 Use an explicit epoch or a coderef when template changes do not need to move
 C<Last-Modified> and you do not rely on response-cache invalidation after a
@@ -633,7 +700,42 @@ sub _options_for {
 	my $options = $state->{options};
 	$options = {%$options, %$override} if ref($override) eq 'HASH';
 
+	# A route default or a controller class can opt a whole group of pages in,
+	# with the buffer stash still the most specific place to say otherwise
+	unless (ref($override) eq 'HASH' && exists($override->{trust_last_modified})) {
+		my $declared = _trust_last_modified_for($c);
+		$options = {%$options, trust_last_modified => $declared} if defined($declared);
+	}
+
 	return ($options, 0);
+}
+
+# L</trust_last_modified> can be declared for a group of pages, either as a
+# route default, which lands in the stash,
+#     $r->get('/about' => {trust_last_modified => 1} => sub {...});
+#     $r->under('/docs')->to(trust_last_modified => 1);
+# or by the controller itself, which its namespace inherits:
+#     sub buffer_trust_last_modified { 1 }
+sub _trust_last_modified_for {
+	my $c = shift;
+
+	my $stashed = $c->stash->{trust_last_modified};
+	return $stashed ? 1 : 0 if defined($stashed) && !ref($stashed);
+
+	my $method = 'buffer_trust_last_modified';
+	return undef unless $c->can($method);
+
+	my $declared = eval { $c->$method };
+	if (my $error = $@) {
+		# A broken declaration must not take the response down with it; the
+		# plugin option stays in force instead
+		$error =~ s/\n+\z//;
+		$c->app->log->debug("Buffer: $method failed: $error");
+		return undef;
+	}
+	return undef if !defined($declared) || ref($declared);
+
+	return $declared ? 1 : 0;
 }
 
 # Wrap the response pipeline so that a request which was building a cache
@@ -758,8 +860,16 @@ sub _process_response {
 				# If-None-Match takes precedence; If-Modified-Since is ignored
 				# even when there is no ETag to compare it with
 				$not_modified = defined($etag) ? _etag_matches($if_none_match, $etag) : 0;
-			} elsif (defined($last_modified) &&
+			} elsif ((!defined($etag) || $options->{trust_last_modified}) &&
+			  defined($last_modified) &&
 			  defined(my $since = $c->req->headers->if_modified_since)) {
+				# Without an entity tag, If-Modified-Since is the only validator
+				# the client can offer.  Last-Modified comes from the application
+				# and its templates, not from the data a page was rendered from,
+				# so on its own it cannot show that the representation is
+				# unchanged: a database row or a stash value can move under a
+				# template that has not been touched.  L</trust_last_modified>
+				# is the opt-in for pages where that cannot happen
 				my $since_epoch = eval { Mojo::Date->new($since)->epoch };
 				$not_modified = 1 if defined($since_epoch) && ($last_modified <= $since_epoch);
 			}
@@ -1781,13 +1891,26 @@ changes, and otherwise expire after L</cache_duration>.
 =head2 Testing
 
 The Redis lock backend has an optional live integration test.  It skips when
-C<MPB_REDIS_URL> (or C<REDIS_URL>) is not set, or when the L<Redis> client
-is not installed.  When a URL is set, the test expects that server to be
-reachable:
+C<MPB_REDIS_URL> (or C<REDIS_SERVER>) is not set, or when neither L<Redis> nor
+L<Redis::Fast> is installed.  Redis::Fast is used when it is the only client
+available.  The test has been run against a live server with each client,
+once with L<Redis> and once with only L<Redis::Fast> available (L<Redis>
+hidden with L<Test::Without::Module>), and both runs include the three-process
+crash check described below.  When either variable is set, the test expects
+that server to be reachable; the value may be a C<redis://> URL or a bare
+C<host:port>, so C<REDIS_SERVER> already in the environment needs no
+rewriting:
 
     MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+    REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
 
-The normal test suite does not require a Redis server.
+That includes a three-process check of the crash path: a worker takes the
+lock and is killed, another process stays blocked until the TTL expires,
+takes the lock over, and a third process is blocked until that owner
+releases it.  The crash test uses a two second lock TTL and waits for it to
+run out rather than sleeping a fixed margin; set C<MPB_REDIS_TTL> to widen
+that further on a heavily loaded machine.  The normal test suite does not
+require a Redis server.
 
 =head2 Why a plugin?
 

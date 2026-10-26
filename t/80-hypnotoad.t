@@ -48,6 +48,9 @@ my $workers_log    = File::Spec->catfile("$tmp", 'workers');
 my $stuck_marker   = File::Spec->catfile("$tmp", 'stuck.marker');
 my $release_marker = File::Spec->catfile("$tmp", 'stuck.release');
 my $die_marker     = File::Spec->catfile("$tmp", 'die.marker');
+my $fail_marker    = File::Spec->catfile("$tmp", 'fail.marker');
+my $fail_release   = File::Spec->catfile("$tmp", 'fail.release');
+my $timeout_log    = File::Spec->catfile("$tmp", 'timeout.workers');
 my $log            = File::Spec->catfile("$tmp", 'hypnotoad.log');
 my $app            = File::Spec->catfile("$tmp", 'app.pl');
 
@@ -119,7 +122,7 @@ get '/cold' => sub {
 	return if $c->buffer_is_cached;
 
 	open(my $fh, '>>', $ENV{MPB_COUNTER}) or die "Cannot write the counter: $!";
-	print $fh "$$\n";
+	print $fh join(' ', $$, ($c->req->headers->header('X-Test-Id') // '')), "\n";
 	close($fh);
 
 	# Keep the entry cold long enough for the other workers to join
@@ -128,10 +131,24 @@ get '/cold' => sub {
 	$c->render(text => 'cold body');
 };
 
+# Records which worker handled a request for the timeout test, so the builder
+# and the waiter can be compared after the fact
+sub log_timeout_worker {
+	my ($role, $id) = @_;
+
+	open(my $fh, '>>', $ENV{MPB_TIMEOUT_LOG}) or die "Cannot write the timeout log: $!";
+	print $fh join(' ', $$, $role, ($id // '')), "\n";
+	close($fh);
+
+	return;
+}
+
 get '/stuck' => sub {
 	my $c = shift;
 	$c->stash(buffer => {cache_key => 'stuck-key'});
 	return if $c->buffer_is_cached;
+
+	log_timeout_worker('builder', 'stuck-builder');
 
 	open(my $fh, '>', $ENV{MPB_STUCK_MARKER}) or die "Cannot write the marker: $!";
 	print $fh "$$\n";
@@ -153,6 +170,10 @@ get '/waiter' => sub {
 		cache_key => 'stuck-key',
 		cache_lock_timeout => 0.5,
 	});
+
+	# Logged before the lookup, so a 503 counts as well
+	log_timeout_worker('waiter', $c->req->headers->header('X-Test-Id'));
+
 	return if $c->buffer_is_cached;
 	$c->render(text => 'the waiter ran instead of waiting');
 };
@@ -180,6 +201,45 @@ get '/recover' => sub {
 	});
 	return if $c->buffer_is_cached;
 	$c->render(text => 'recovered body');
+};
+
+get '/fail' => sub {
+	my $c = shift;
+	$c->stash(buffer => {cache_key => 'fail-key'});
+	return if $c->buffer_is_cached;
+
+	open(my $fh, '>', $ENV{MPB_FAIL_MARKER}) or die "Cannot write the marker: $!";
+	print $fh "$$\n";
+	close($fh);
+
+	# Hold the shared lock until the test has a waiter, then fail.  The action
+	# dies with the lock still held, so releasing it is the plugin's job.
+	my $deadline = time + 10;
+	while (!-e $ENV{MPB_FAIL_RELEASE} && (time < $deadline)) {
+		select(undef, undef, undef, 0.05);
+	}
+
+	die "deliberate failure while holding the lock\n";
+};
+
+get '/fail-waiter' => sub {
+	my $c = shift;
+	$c->stash(buffer => {
+		cache_key => 'fail-key',
+		cache_lock_timeout => 0.5,
+	});
+	return if $c->buffer_is_cached;
+	$c->render(text => 'the waiter ran instead of waiting');
+};
+
+get '/fail-recover' => sub {
+	my $c = shift;
+	$c->stash(buffer => {
+		cache_key => 'fail-key',
+		cache_lock_timeout => 1,
+	});
+	return if $c->buffer_is_cached;
+	$c->render(text => 'rebuilt after the failure');
 };
 
 app->config(hypnotoad => {
@@ -243,6 +303,9 @@ if (!$server_pid) {
 	$ENV{MPB_STUCK_MARKER}   = $stuck_marker;
 	$ENV{MPB_RELEASE_MARKER} = $release_marker;
 	$ENV{MPB_DIE_MARKER}     = $die_marker;
+	$ENV{MPB_FAIL_MARKER}    = $fail_marker;
+	$ENV{MPB_FAIL_RELEASE}   = $fail_release;
+	$ENV{MPB_TIMEOUT_LOG}    = $timeout_log;
 	$ENV{PERL5LIB}       = join(':', $lib, grep { defined($_) && length($_) } ($ENV{PERL5LIB} // ''));
 	$ENV{HYPNOTOAD_FOREGROUND} = 1;
 	delete @ENV{qw(HYPNOTOAD_EXE HYPNOTOAD_APP HYPNOTOAD_PID HYPNOTOAD_REV)};
@@ -296,13 +359,45 @@ my $client = Mojo::UserAgent->new(
 	request_timeout => 10,
 	max_connections => 20,
 );
-my (@tx, $error);
-Mojo::Promise->all(map {
-	$client->get_p("$base/cold" => {Connection => 'close', 'X-Test-Id' => $_})
-} 1 .. 6)
-	->then(sub { @tx = map { @$_ } @_ })
-	->catch(sub { $error = shift })
-	->wait;
+# A worker can accept several connections before its event loop starts the
+# first of them, so the pool is free to hand every connection in a batch to
+# one worker.  When that happens no cross-worker coalescing took place, which
+# says nothing about the plugin, so try again with a fresh cache key instead
+# of failing on the scheduler.  Each extra attempt costs about a second.
+my (@tx, @ids, $error, $round, $spread, %handled, %builds);
+for my $attempt (1 .. 3) {
+	$round = $attempt;
+	@ids   = map { "r$attempt-$_" } 1 .. 6;
+	@tx    = ();
+	$error = undef;
+
+	Mojo::Promise->all(map {
+		$client->get_p("$base/cold?round=$attempt" => {Connection => 'close', 'X-Test-Id' => $_})
+	} @ids)
+		->then(sub { @tx = map { @$_ } @_ })
+		->catch(sub { $error = shift })
+		->wait;
+
+	%handled = %{log_entries($workers_log, "r$attempt-")};
+
+	# %handled is keyed by request id, so count the workers, not the entries
+	my %seen = map { $handled{$_} => 1 } keys %handled;
+	$spread = !defined($error) && (scalar(keys %seen) > 1);
+	last if $spread;
+
+	report_round("attempt $attempt of 3 discarded: "
+		. (defined($error)
+			? "the batch failed: $error"
+			: 'all six connections reached one worker'));
+}
+
+report_round(
+	$spread
+	? ($round == 1
+		? 'the cold batch was spread over the pool on the first attempt'
+		: "the cold batch needed $round attempts before the pool spread it over more than one worker")
+	: 'no attempt spread the cold batch over the pool; cross-worker coalescing was not exercised'
+);
 
 ok(!defined($error), 'all concurrent requests completed') or diag("Request failed: $error");
 is(scalar(@tx), 6, 'six responses');
@@ -313,33 +408,15 @@ my @cache = map { $_->res ? $_->res->headers->header('X-Cache') : undef } @tx;
 is(scalar(grep { defined($_) && ($_ eq 'MISS') } @cache), 1, 'one request built the entry');
 is(scalar(grep { defined($_) && ($_ eq 'HIT') } @cache), 5, 'the other requests replayed it');
 
-my @handled;
-if (open(my $fh, '<', $workers_log)) {
-	@handled = grep { /\S/ } <$fh>;
-	close($fh);
-} else {
-	fail("Cannot read the worker log: $!");
-}
-is(scalar(@handled), 6, 'every concurrent request recorded its worker');
+is_deeply([sort keys %handled], [sort @ids], "round $round recorded every concurrent request");
 
-my (%worker_pids, %request_ids);
-for my $line (@handled) {
-	my ($pid, $id) = split(/\s+/, $line);
-	$worker_pids{$pid} = 1 if defined($pid) && length($pid);
-	$request_ids{$id} = 1 if defined($id) && length($id);
-}
+my %worker_pids = map { $handled{$_} => 1 } keys %handled;
 cmp_ok(scalar(keys %worker_pids), '>', 1,
-	'concurrent cold requests were served by more than one worker pid');
-is_deeply([sort { $a <=> $b } keys %request_ids], [1 .. 6], 'every request was accounted for');
+	"round $round spread the cold requests over more than one worker pid")
+	or diag('Every connection went to one worker on all three attempts, so cross-worker coalescing was not exercised');
 
-my @runs;
-if (open(my $fh, '<', $counter)) {
-	@runs = grep { /\S/ } <$fh>;
-	close($fh);
-} else {
-	fail("Cannot read the counter: $!");
-}
-is(scalar(@runs), 1, 'the action ran exactly once across all workers');
+%builds = %{log_entries($counter, "r$round-")};
+is(scalar(keys %builds), 1, 'the action ran exactly once across all workers');
 
 diag("Server log:\n" . read_file($log))
 	if defined($error) || (grep { !$_->res || !$_->res->is_success || ($_->res->code != 200) } @tx);
@@ -375,7 +452,10 @@ ok($holding, 'the builder acquired the shared lock') or diag("Server log:\n" . r
 my ($waiter_res, $waiter_elapsed);
 if ($holding) {
 	my $started = Time::HiRes::time();
-	my $waiter_tx = $client->get("$base/waiter" => {Connection => 'close'});
+	my $waiter_tx = $client->get("$base/waiter" => {
+		Connection    => 'close',
+		'X-Test-Id'   => 'timeout-waiter',
+	});
 	$waiter_elapsed = Time::HiRes::time() - $started;
 	$waiter_res = $waiter_tx->res;
 }
@@ -399,10 +479,43 @@ if ($holding) {
 	like($waiter_res ? $waiter_res->body : '', qr/being generated/, 'the waiter received the retry page');
 	cmp_ok($waiter_elapsed, '<', 2.5, 'the waiter timed out before the builder released the lock');
 
-	my $after_tx = $client->get("$base/waiter" => {Connection => 'close'});
+	my $after_tx = $client->get("$base/waiter" => {
+		Connection  => 'close',
+		'X-Test-Id' => 'after-waiter',
+	});
 	is($after_tx->res->code, 200, 'the cache entry is available after the builder finishes');
 	is($after_tx->res->headers->header('X-Cache'), 'HIT', 'the finished entry is replayed');
 	is($after_tx->res->body, 'stuck body', 'the cached builder body is served');
+
+	# The waiter can only receive 503 while the builder is still working if
+	# another worker handled it, so check the workers rather than assuming it
+	my %timeout_pid;
+	if (open(my $fh, '<', $timeout_log)) {
+		for my $line (<$fh>) {
+			my ($pid, $role, $id) = split(/\s+/, $line);
+			next unless defined($pid) && defined($role) && defined($id) && length($id);
+			$timeout_pid{"$role:$id"} = $pid;
+		}
+		close($fh);
+	} else {
+		fail("Cannot read the timeout log: $!");
+	}
+
+	my $stuck_pid;
+	if (open(my $fh, '<', $stuck_marker)) {
+		$stuck_pid = <$fh>;
+		close($fh);
+		chomp($stuck_pid) if defined($stuck_pid);
+	}
+
+	ok(defined($stuck_pid) && ($stuck_pid =~ /^\d+$/), 'the builder recorded the worker holding the lock')
+		or diag("Server log:\n" . read_file($log));
+	is($timeout_pid{'builder:stuck-builder'}, $stuck_pid, 'the logged builder is the worker holding the lock');
+
+	my $waiter_pid = $timeout_pid{'waiter:timeout-waiter'};
+	ok(defined($waiter_pid) && ($waiter_pid =~ /^\d+$/), 'the 503 waiter recorded its worker')
+		or diag("Server log:\n" . read_file($log));
+	isnt($waiter_pid, $stuck_pid, 'the 503 waiter ran on a different worker than the builder');
 }
 
 # A worker killed while holding the lock cannot run release code.  The kernel
@@ -446,6 +559,70 @@ if ($dead) {
 	is($again_tx->res->body, 'recovered body', 'the recovered body is cached');
 }
 
+# An action that dies while holding the shared lock.  The worker survives, so
+# the plugin itself must release the lock after the failed response rather
+# than relying on the kernel closing the lock file.
+unlink($fail_marker);
+unlink($fail_release);
+pipe(my $fail_reader, my $fail_writer) or die "Cannot create a pipe: $!";
+my $fail_pid = fork;
+defined($fail_pid) or die "Cannot fork: $!";
+
+if (!$fail_pid) {
+	close($fail_reader);
+	my $fail_ua = Mojo::UserAgent->new(connect_timeout => 2, request_timeout => 10);
+	my $tx = $fail_ua->get("$base/fail" => {Connection => 'close'});
+	my $code = $tx->res ? $tx->res->code : 0;
+	print {$fail_writer} "$code\n";
+	close($fail_writer);
+	POSIX::_exit(0);
+}
+
+close($fail_writer);
+
+my $fail_deadline = Time::HiRes::time() + 5;
+while (!-e $fail_marker && Time::HiRes::time() < $fail_deadline) {
+	Time::HiRes::sleep(0.05);
+}
+my $fail_holding = -e $fail_marker;
+ok($fail_holding, 'the failing builder acquired the shared lock')
+	or diag("Server log:\n" . read_file($log));
+
+my $fail_waiter;
+if ($fail_holding) {
+	my $tx = $client->get("$base/fail-waiter" => {Connection => 'close'});
+	$fail_waiter = $tx->res;
+}
+
+# Let the failing builder die even if the waiter check failed
+open(my $fail_release_fh, '>', $fail_release) or die "Cannot release the failing builder: $!";
+close($fail_release_fh);
+
+my $fail_line = <$fail_reader>;
+close($fail_reader);
+waitpid($fail_pid, 0);
+chomp($fail_line) if defined($fail_line);
+is($fail_line, 500, 'the failing builder answered with 500 rather than a page');
+
+if ($fail_holding) {
+	is($fail_waiter ? $fail_waiter->code : 0, 503, 'the waiter received 503 when the builder failed');
+	is($fail_waiter ? $fail_waiter->headers->header('Retry-After') : undef, 1, 'the waiter was told to retry');
+	is($fail_waiter ? $fail_waiter->headers->header('X-Cache') : undef, 'MISS', 'the failed response was not cached');
+	like($fail_waiter ? $fail_waiter->body : '', qr/being generated/, 'the waiter received the retry page');
+}
+
+# The lock must be free again, so this rebuilds instead of waiting out its
+# cache_lock_timeout
+my $rebuilt_tx = $client->get("$base/fail-recover" => {Connection => 'close'});
+is($rebuilt_tx->res ? $rebuilt_tx->res->code : 0, 200, 'a later request rebuilt the key the failure abandoned');
+is($rebuilt_tx->res ? $rebuilt_tx->res->headers->header('X-Cache') : undef, 'MISS',
+	'the rebuilt request missed the cache');
+is($rebuilt_tx->res ? $rebuilt_tx->res->body : undef, 'rebuilt after the failure',
+	'the rebuilt page replaced the failed one');
+
+my $rebuilt_again = $client->get("$base/fail-recover" => {Connection => 'close'});
+is($rebuilt_again->res->headers->header('X-Cache'), 'HIT', 'the rebuilt entry is replayed');
+
 stop_server();
 done_testing();
 
@@ -468,6 +645,35 @@ sub read_file {
 	close($fh);
 
 	return $content // '';
+}
+
+# CI runs `prove -lr t/`, which only prints the TAP comments of a file that
+# fails, so the round is announced on STDERR where it stays in the log even
+# when every test passes
+sub report_round {
+	my $message = shift;
+
+	print STDERR "# $message\n";
+
+	return;
+}
+
+# Lines written as "pid request-id", filtered by request-id prefix so that a
+# retried batch can be told apart from the one before it
+sub log_entries {
+	my ($path, $prefix) = @_;
+
+	my %entry;
+	open(my $fh, '<', $path) or return {};
+	while (my $line = <$fh>) {
+		my ($pid, $id) = split(/\s+/, $line);
+		next unless defined($pid) && defined($id) && length($id);
+		next unless index($id, $prefix) == 0;
+		$entry{$id} = $pid;
+	}
+	close($fh);
+
+	return \%entry;
 }
 
 sub failure_message {

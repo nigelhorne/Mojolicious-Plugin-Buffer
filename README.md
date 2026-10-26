@@ -77,8 +77,8 @@ site with relative links;
 - compresses the response with whichever of Brotli, Zstandard or gzip
 the client prefers and the server supports;
 - adds `ETag`, `Last-Modified` and `Vary` headers, and answers
-`If-None-Match` and `If-Modified-Since` conditional requests with
-`304 Not Modified`;
+`If-None-Match` conditional requests, or `If-Modified-Since` when no `ETag`
+is generated, with `304 Not Modified`;
 - sets an accurate `Content-Length` after the above changes;
 - optionally stores the finished page in a server-side cache and
 replays it for later requests, so that an action can skip its expensive
@@ -138,16 +138,26 @@ representation of the same page have different tags.
 ## generate\_304
 
 Answer conditional requests with `304 Not Modified` when the
-`If-None-Match` (or, when it is absent, `If-Modified-Since`) header
-matches, defaults to 1.  `If-None-Match` takes precedence over
-`If-Modified-Since`, as required by RFC 7232.  Requires ["generate\_etag"](#generate_etag)
-for the `ETag` comparison.
+`If-None-Match` header matches, defaults to 1.  `If-None-Match` takes
+precedence over `If-Modified-Since`, as required by RFC 7232.
+
+`If-Modified-Since` is only used when no `ETag` is generated for the
+response, which means ["generate\_etag"](#generate_etag) is off, unless
+["trust\_last\_modified"](#trust_last_modified) opts back in.  `Last-Modified` is derived
+from the application and its templates, and says nothing about the data a
+page was rendered from: a database row or a stash value can change while the
+template stays untouched.  A 304 on the timestamp alone would tell such a
+client that its stale copy is current, so with an `ETag` available only the
+tag can revalidate the response.  Clients that have the tag, which includes
+browsers after the first `200`, send `If-None-Match` and are unaffected.
 
 ## last\_modified
 
-Add a `Last-Modified` header and honour `If-Modified-Since`, defaults to 1,
-which uses the newest modification time of the application script (`$0`)
-and the renderer's template files and directories.  May be:
+Add a `Last-Modified` header, and honour `If-Modified-Since` when no
+`ETag` is generated (see ["generate\_304"](#generate_304)) or
+["trust\_last\_modified"](#trust_last_modified) is set, defaults to 1, which
+uses the newest modification time of the application script (`$0`) and the
+renderer's template files and directories.  May be:
 
 - 0 - do not generate the header
 - 1 - use the newest modification time of the application script (`$0`) and
@@ -170,7 +180,61 @@ or a coderef there.  The template paths are scanned once per request, unless
 tree or an application that does not use templates, an explicit epoch or
 coderef is cheaper.  Database rows and other inputs are not covered; use a
 coderef for pages whose freshness depends on them, or set
-`last_modified => 0` and rely on ["generate\_etag"](#generate_etag) alone.
+`last_modified => 0` and rely on ["generate\_etag"](#generate_etag) alone.  A
+page whose data changes without its template changing is never answered with
+a 304 from this timestamp while an `ETag` is generated, but the header itself
+still only describes the code, so a client that keeps `If-Modified-Since`
+without the tag will keep refetching it.
+
+## trust\_last\_modified
+
+Answer `If-Modified-Since` even when an `ETag` is generated, defaults to 0.
+Only enable it for pages whose body is a function of the application and its
+templates, with no database rows, session values or other inputs that can
+change under an untouched template.
+
+["last\_modified"](#last_modified) describes the code, not the body, which is why
+`If-Modified-Since` is otherwise ignored while a tag exists.  Turning this
+on restores timestamp revalidation for clients that send only
+`If-Modified-Since`, so a page rendered from its templates alone can be
+revalidated by those clients without a tag.  `If-None-Match` still takes
+precedence, so a client holding the tag is still protected from a stale copy
+even here:
+
+    plugin 'Buffer' => {
+        trust_last_modified => 1,   # this application only renders templates
+    };
+
+Use it per response instead with `$c->stash(buffer => {trust_last_modified
+=> 1})` when only some pages are that predictable.
+
+A whole group of pages can opt in once.  The easiest way is a route default,
+which [Mojolicious](https://metacpan.org/pod/Mojolicious) copies into the stash:
+
+    # one route
+    $r->get('/about' => {trust_last_modified => 1} => sub {...});
+
+    # everything beneath an under route
+    my $docs = $r->under('/docs')->to(trust_last_modified => 1);
+    $docs->get('/intro' => sub {...});
+
+A controller can declare it for itself and, through a base class, for its
+whole namespace:
+
+    package MyApp::Controller::Docs;
+    use Mojo::Base 'Mojolicious::Controller';
+    has buffer_trust_last_modified => 1;
+
+    sub intro { shift->render(template => 'docs/intro') }
+
+A plain `sub buffer_trust_last_modified { 1 }` works too, for a value that
+depends on something the controller knows at request time.
+
+A route default wins over the controller declaration, so a route default of
+`0` opts one page back out of a trusting namespace, and the `buffer` stash
+overrides both.  The declaration has no effect when
+["generate\_304"](#generate_304) is off, and it cannot make a page safe: it
+only says that the application and its templates really are the only inputs.
 
 ## Last-Modified performance
 
@@ -178,10 +242,14 @@ The scan costs one `stat()` per file and directory under the renderer's
 paths.  On a tree of 10,000 templates in 100 directories, a request using the
 default scan took about 40 milliseconds of CPU on the machine used for these
 measurements, against about 1 millisecond for the same request with an
-explicit epoch; that is roughly 4 microseconds per tree entry.  The numbers
-are indicative, not a promise, and a faster or slower filesystem will move
-them.  Run [benchmarks/last_modified.pl](benchmarks/last_modified.pl) with
-your own tree size to measure it.
+explicit epoch; that is roughly 4 microseconds per tree entry.  With
+["template\_mtime\_cache"](#template_mtime_cache) in front of it, the same
+request also took about 1 millisecond, the cache lookup adding only a few
+tens of microseconds, so the middle ground gives up roughly 2% of the scan's
+cost to keep template awareness.  The numbers are indicative, not a promise,
+and a faster or slower filesystem will move them.  Run
+[benchmarks/last_modified.pl](benchmarks/last_modified.pl) with your own tree
+size to measure all three variants.
 
 Use an explicit epoch or a coderef when template changes do not need to move
 `Last-Modified` and you do not rely on response-cache invalidation after a
@@ -566,13 +634,28 @@ script or a template changes, and otherwise expire after
 ## Testing
 
 The Redis lock backend has an optional live integration test.  It skips when
-`MPB_REDIS_URL` (or `REDIS_URL`) is not set, or when the [Redis](https://metacpan.org/pod/Redis) client
-is not installed.  When a URL is set, the test expects that server to be
-reachable:
+`MPB_REDIS_URL` (or `REDIS_SERVER`) is not set, or when neither the
+[Redis](https://metacpan.org/pod/Redis) nor [Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) client is installed.
+Redis::Fast is used when it is the only client available.  The test has been
+run against a live server with each client, once with
+[Redis](https://metacpan.org/pod/Redis) and once with only
+[Redis::Fast](https://metacpan.org/pod/Redis%3A%3AFast) available ([Redis](https://metacpan.org/pod/Redis) hidden with
+[Test::Without::Module](https://metacpan.org/pod/Test%3A%3AWithout%3A%3AModule)), and both runs include the three-process
+crash check described below.  When either variable is set, the test expects
+that server to be reachable; the value may be a `redis://` URL or a bare
+`host:port`, so a `REDIS_SERVER` already in the environment needs no
+rewriting:
 
     MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
+    REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
 
-The normal test suite does not require a Redis server.
+That includes a three-process check of the crash path: a worker takes the
+lock and is killed, another process stays blocked until the TTL expires,
+takes the lock over, and a third process is blocked until that owner
+releases it.  The crash test uses a two second lock TTL and waits for it to
+run out rather than sleeping a fixed margin; set `MPB_REDIS_TTL` to widen
+that further on a heavily loaded machine.  The normal test suite does not
+require a Redis server.
 
 ## Why a plugin?
 
