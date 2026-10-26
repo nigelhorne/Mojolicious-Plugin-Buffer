@@ -145,6 +145,83 @@ subtest 'per-request stash overrides' => sub {
 	ok(!defined($t->tx->res->headers->etag), 'buffer => 0 also skips the ETag');
 };
 
+{
+	package TestBuffer::Controller::Assets;
+	use Mojo::Base 'Mojolicious::Controller';
+
+	has buffer_compress_content => 0;
+
+	sub page { shift->render(text => $LONG) }
+}
+
+{
+	package TestBuffer::Controller::Pages;
+	use Mojo::Base 'Mojolicious::Controller';
+
+	sub page { shift->render(text => $LONG) }
+}
+
+subtest 'compress_content can be declared for a group of pages' => sub {
+	my $app = Mojolicious->new;
+	$app->log->level('error');
+	$app->plugin('Buffer');
+
+	my $r = $app->routes;
+	$r->get('/route' => {compress_content => 0} => sub { shift->render(text => $LONG) });
+	$r->get('/plain' => sub { shift->render(text => $LONG) });
+
+	# A section that serves files it has already compressed
+	my $assets = $r->under('/assets')->to(compress_content => 0);
+	$assets->get('/file' => sub { shift->render(text => $LONG) });
+	$assets->get('/override' => sub {
+		my $c = shift;
+		$c->stash(buffer => {compress_content => 1});
+		$c->render(text => $LONG);
+	});
+
+	$r->namespaces(['TestBuffer::Controller']);
+	$r->get('/asset-page')->to('Assets#page');
+	$r->get('/plain-page')->to('Pages#page');
+
+	my $group = Test::Mojo->new($app);
+	$group->ua->transactor->compressed(0);
+
+	$group->get_ok('/route' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($group->tx->res->headers->content_encoding), 'a route default turns compression off');
+	is($group->tx->res->body, $LONG, 'the body is sent uncompressed');
+
+	$group->get_ok('/assets/file' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($group->tx->res->headers->content_encoding),
+		'an under route turns compression off beneath it');
+	ok(!defined($group->tx->res->headers->vary), 'no Vary where the group never compresses');
+
+	$group->get_ok('/asset-page' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($group->tx->res->headers->content_encoding),
+		'a controller declaration turns compression off for its namespace');
+
+	$group->get_ok('/plain' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($group->tx->res->headers->content_encoding, 'gzip', 'a page outside the group is still compressed');
+	is(gunzip($group->tx->res->body), $LONG, 'the compressed body round-trips');
+
+	$group->get_ok('/plain-page' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($group->tx->res->headers->content_encoding, 'gzip',
+		'a controller without the declaration is still compressed');
+
+	$group->get_ok('/assets/override' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($group->tx->res->headers->content_encoding, 'gzip', 'the buffer stash overrides the group');
+
+	# A declaration can also opt in where the plugin is off
+	my $off_app = Mojolicious->new;
+	$off_app->log->level('error');
+	$off_app->plugin('Buffer', compress_content => 0);
+	$off_app->routes->get('/on' => {compress_content => 1} => sub { shift->render(text => $LONG) });
+
+	my $on = Test::Mojo->new($off_app);
+	$on->ua->transactor->compressed(0);
+	$on->get_ok('/on' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($on->tx->res->headers->content_encoding, 'gzip', 'a declaration opts in where the plugin is off');
+};
+
 subtest 'pre-encoded responses are left alone' => sub {
 	$t->get_ok('/encoded' => {'Accept-Encoding' => 'gzip'})->status_is(200);
 	is($t->tx->res->headers->content_encoding, 'gzip', 'Content-Encoding is unchanged');

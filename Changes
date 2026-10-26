@@ -31,12 +31,19 @@ Revision history for Mojolicious-Plugin-Buffer
 	with a fresh cache key when the pool hands every connection to one
 	worker, so the assertion tests the plugin and not the scheduler, and
 	report the attempt that worked on STDERR so retries show up in CI logs.
+	Assert that report with a fake single-worker pool: three discarded
+	attempts and the never-spread message, without waiting on the scheduler,
+	and run the same drill against a real single-worker hypnotoad when
+	MPB_LIVE_RETRY is set.
 	Add a runnable hypnotoad example under eg/hypnotoad, and a smoke test
 	that starts it on an ephemeral port and checks a MISS followed by a HIT.
 	Add an optional live Redis integration test, skipped unless
 	MPB_REDIS_URL or REDIS_SERVER is configured, with Redis::Fast accepted as
-	an alternative to Redis, and an unreachable ambient REDIS_SERVER skipping
-	the file rather than failing.
+	an alternative to Redis, and an unreachable REDIS_SERVER failing the file
+	rather than being silently skipped.
+	Run the live Redis test in CI against a Redis service, once with Redis
+	and once with only Redis::Fast, each run asserting from the test output
+	which client it used, and summarise both runs on the job page.
 	Exercise the Redis lock crash path with three processes: a killed
 	holder, a blocked waiter and a takeover once the TTL expires, with the
 	TTL configurable through MPB_REDIS_TTL and generous socket timeouts so
@@ -53,4 +60,7 @@ Revision history for Mojolicious-Plugin-Buffer
 	default (including an under route) or a controller declaration, so a
 	whole namespace opts in once instead of repeating the stash.
 	Offer the same declaration for optimise_content, so static sections can
-	be optimised as a group.
+	be optimised as a group, for compress_content, so a section serving
+	pre-compressed files can opt out once, and for rewrite_links, so a
+	section whose HTML is used elsewhere keeps its absolute links.  Leave
+	generate_etag and generate_304 per-endpoint, and say why.

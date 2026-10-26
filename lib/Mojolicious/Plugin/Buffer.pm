@@ -172,6 +172,18 @@ remember that the plugin turns off L<Mojolicious::Renderer/compress>, so a
 response will then not be compressed at all).  The encodings offered to
 clients are controlled by L</encodings>.
 
+Like L</optimise_content>, it can be declared once for a group of pages, which
+is the point of a section that serves files it has already compressed:
+
+    my $assets = $r->under('/assets')->to(compress_content => 0);
+
+    package MyApp::Controller::Assets;
+    use Mojo::Base 'Mojolicious::Controller';
+    has buffer_compress_content => 0;
+
+A route default raises or lowers it for that route, the declaration beats the
+plugin option, and the C<buffer> stash overrides both.
+
 =head2 optimise_content
 
 How hard to optimise HTML, defaults to 0 (off):
@@ -216,12 +228,25 @@ point at the current site as absolute URLs into root-relative links, and
 links to the current script with a query string into just the query string.
 Defaults to 1.  Has no effect unless L</optimise_content> is enabled.
 
+It is declared for a group of pages in the same way as L</optimise_content>,
+which matters for a section whose HTML is not used in place: a preview of a
+newsletter or a page rendered for another site needs its absolute URLs kept
+while still being optimised elsewhere.
+
+    my $preview = $r->under('/preview')->to(optimise_content => 1, rewrite_links => 0);
+
 =head2 generate_etag
 
 Add an C<ETag> header to C<200> responses to C<GET> and C<HEAD> requests,
 defaults to 1.  The tag is the MD5 of the response body before compression,
 with a suffix for the content coding, so a gzip and an identity
 representation of the same page have different tags.
+
+Unlike L</optimise_content>, this is not declarable for a group of pages: it
+is a per-endpoint decision about whether a digest is worth computing, not a
+policy for a section of the site.  Skip the digest for one response with
+C<< $c->stash(buffer => {generate_etag => 0}) >>, or for the whole
+application with the plugin option.
 
 =head2 generate_304
 
@@ -238,6 +263,13 @@ A 304 on the timestamp alone would tell such a client that its stale copy is
 current, so with an C<ETag> available only the tag can revalidate the
 response.  Clients that have the tag, which includes browsers after the first
 C<200>, send C<If-None-Match> and are unaffected.
+
+Like L</generate_etag>, this is not declarable for a group of pages.  It is
+the switch that decides whether a client is told its copy is current, and a
+group that also sets L</trust_last_modified> would contradict itself if it
+could turn the answer off as well.  Use
+C<< $c->stash(buffer => {generate_304 => 0}) >> where one endpoint must always
+send a body.
 
 =head2 last_modified
 
@@ -712,7 +744,7 @@ sub _module_available {
 #     $r->under('/docs')->to(optimise_content => 1);
 # or by the controller itself, which its namespace inherits:
 #     sub buffer_optimise_content { 1 }
-my @GROUP_OPTIONS = qw(optimise_content trust_last_modified);
+my @GROUP_OPTIONS = qw(compress_content optimise_content rewrite_links trust_last_modified);
 
 sub _options_for {
 	my ($c, $state) = @_;
@@ -1912,21 +1944,22 @@ changes, and otherwise expire after L</cache_duration>.
 The Redis lock backend has an optional live integration test.  It skips when
 C<MPB_REDIS_URL> (or C<REDIS_SERVER>) is not set, or when neither L<Redis> nor
 L<Redis::Fast> is installed.  Redis::Fast is used when it is the only client
-available.  The test has been run against a live server with each client,
+available.  CI runs the test against a live Redis service with each client,
 once with L<Redis> and once with only L<Redis::Fast> available (L<Redis>
-hidden with L<Test::Without::Module>), and both runs include the three-process
-crash check described below.  When either variable is set, the test expects
-that server to be reachable; the value may be a C<redis://> URL or a bare
-C<host:port>, so C<REDIS_SERVER> already in the environment needs no
-rewriting:
+hidden with L<Test::Without::Module>), and each run proves from the test
+output which client it used, so both paths include the three-process crash
+check described below rather than merely being wired up.  When either
+variable is set, the test expects that server to be reachable; the value may
+be a C<redis://> URL or a bare C<host:port>, so C<REDIS_SERVER> already in
+the environment needs no rewriting:
 
     MPB_REDIS_URL=redis://127.0.0.1:6379 prove -Ilib t/76-live-redis.t
     REDIS_SERVER=127.0.0.1:6379 prove -Ilib t/76-live-redis.t
 
-A server named by C<MPB_REDIS_URL> must answer, because the variable exists
-for this test.  C<REDIS_SERVER> is usually exported for other programs, so a
-server it names that cannot be reached skips the file rather than failing an
-unrelated checkout.
+A server named by either variable must answer.  The variable says a live
+Redis is there for this test, so an unreachable one fails the file, naming
+the variable and the connection error, rather than skipping and looking like
+a checkout with no Redis configured.  Unset both to skip the test.
 
 That includes a three-process check of the crash path: a worker takes the
 lock and is killed, another process stays blocked until the TTL expires,

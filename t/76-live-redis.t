@@ -18,10 +18,10 @@ use Mojolicious::Plugin::Buffer::Lock::Redis;
 # can drive the client side.  MPB_REDIS_TTL raises the lock TTL used by the
 # crash test on a heavily loaded machine.
 #
-# MPB_REDIS_URL names a server for this test, so a server that cannot be
-# reached is a failure.  REDIS_SERVER is usually exported for other reasons,
-# so an unreachable one skips the file instead of turning an unrelated
-# checkout red.
+# Either variable names a server for this test, so a server that cannot be
+# reached is a failure: a checkout that looks configured for a live Redis but
+# silently skips would hide a Redis that is down or a variable pointing at the
+# wrong place.  Unset both variables to skip the file.
 my ($url, $source);
 for my $name (qw(MPB_REDIS_URL REDIS_SERVER)) {
 	next unless defined($ENV{$name}) && length($ENV{$name});
@@ -30,13 +30,6 @@ for my $name (qw(MPB_REDIS_URL REDIS_SERVER)) {
 }
 plan skip_all => 'set MPB_REDIS_URL or REDIS_SERVER to a running Redis server'
 	unless defined($url);
-
-sub skip_or_die {
-	my $message = shift;
-
-	plan skip_all => "$message (from $source)" if $source eq 'REDIS_SERVER';
-	die "$message\n";
-}
 
 my $client_class;
 for my $module (qw(Redis Redis::Fast)) {
@@ -47,6 +40,9 @@ for my $module (qw(Redis Redis::Fast)) {
 }
 plan skip_all => 'install Redis or Redis::Fast to run the live Redis test'
 	unless $client_class;
+
+# CI checks this line to prove which client ran, so keep it in that shape
+diag("the live Redis test is using $client_class");
 
 my $server = $url;
 $server =~ s{^redis://}{};
@@ -73,13 +69,13 @@ sub new_client {
 my $redis = eval { new_client() };
 if (my $error = $@) {
 	chomp($error);
-	skip_or_die("Cannot create a $client_class client for $url: $error");
+	die "Cannot create a $client_class client for $url (from $source): $error\n";
 }
 
 my $pong = eval { $redis->ping };
 if (my $error = $@) {
 	chomp($error);
-	skip_or_die("Cannot reach Redis at $url: $error");
+	die "Cannot reach Redis at $url (from $source): $error\n";
 }
 is($pong, 'PONG', 'the live Redis server is reachable');
 

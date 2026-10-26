@@ -190,4 +190,82 @@ subtest 'optimise_content can be declared for a group of pages' => sub {
 	like($group->tx->res->body, $original, 'the buffer stash overrides the group');
 };
 
+# The HTML with the current request's origin filled in, so link rewriting is
+# visible
+sub origin_html {
+	my $c = shift;
+
+	my $url    = $c->req->url->to_abs;
+	my $origin = $url->scheme . '://' . ($url->host_port // $url->host);
+	(my $html = $HTML) =~ s/__ORIGIN__/$origin/g;
+	$html =~ s/__PATH__/$c->req->url->path->to_string/g;
+
+	return $html;
+}
+
+{
+	package TestBuffer::Controller::Preview;
+	use Mojo::Base 'Mojolicious::Controller';
+
+	has buffer_optimise_content => 1;
+	has buffer_rewrite_links    => 0;
+
+	sub page { my $c = shift; $c->render(text => main::origin_html($c)) }
+}
+
+subtest 'rewrite_links can be declared for a group of pages' => sub {
+	my $app = Mojolicious->new;
+	$app->log->level('error');
+	$app->plugin('Buffer');
+
+	my $r = $app->routes;
+	$r->get('/rewritten' => {optimise_content => 1} => sub {
+		my $c = shift;
+		$c->render(text => origin_html($c));
+	});
+	$r->get('/kept' => {optimise_content => 1, rewrite_links => 0} => sub {
+		my $c = shift;
+		$c->render(text => origin_html($c));
+	});
+
+	# A preview of HTML that will be used elsewhere, so its links must survive
+	my $preview = $r->under('/preview')->to(optimise_content => 1, rewrite_links => 0);
+	$preview->get('/page' => sub {
+		my $c = shift;
+		$c->render(text => origin_html($c));
+	});
+	$preview->get('/override' => sub {
+		my $c = shift;
+		$c->stash(buffer => {rewrite_links => 1});
+		$c->render(text => origin_html($c));
+	});
+
+	$r->namespaces(['TestBuffer::Controller']);
+	$r->get('/preview-page')->to('Preview#page');
+
+	my $group = Test::Mojo->new($app);
+	$group->ua->transactor->compressed(0);
+
+	$group->get_ok('/rewritten')->status_is(200);
+	like($group->tx->res->body, qr{href="/page"}, 'a page outside the group has its links rewritten');
+
+	$group->get_ok('/kept')->status_is(200);
+	like($group->tx->res->body, qr{href="http://127\.0\.0\.1:\d+/page"},
+		'a route default keeps absolute links');
+	unlike($group->tx->res->body, qr{href="/page"}, 'the link was not rewritten');
+	like($group->tx->res->body, qr{<p>Hello World</p>}, 'the page is still optimised');
+
+	$group->get_ok('/preview/page')->status_is(200);
+	like($group->tx->res->body, qr{href="http://127\.0\.0\.1:\d+/page"},
+		'an under route keeps absolute links beneath it');
+	like($group->tx->res->body, qr{<p>Hello World</p>}, 'the under route still optimises');
+
+	$group->get_ok('/preview-page')->status_is(200);
+	like($group->tx->res->body, qr{href="http://127\.0\.0\.1:\d+/page"},
+		'a controller declaration keeps absolute links');
+
+	$group->get_ok('/preview/override')->status_is(200);
+	like($group->tx->res->body, qr{href="/page"}, 'the buffer stash overrides the group');
+};
+
 done_testing();

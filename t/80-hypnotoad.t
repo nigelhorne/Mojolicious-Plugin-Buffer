@@ -34,14 +34,8 @@ my $cache_dir = File::Spec->catdir("$tmp", 'cache');
 my $lock_dir  = File::Spec->catdir("$tmp", 'locks');
 mkdir($cache_dir) or die "Cannot create $cache_dir: $!";
 
-my $probe = IO::Socket::INET->new(
-	LocalAddr => '127.0.0.1',
-	LocalPort => 0,
-	Listen    => 1,
-	ReuseAddr => 1,
-) or plan skip_all => "Cannot bind a local port: $!";
-my $port = $probe->sockport;
-close($probe);
+my $port = free_port()
+	or plan skip_all => 'Cannot bind a local port';
 
 my $counter        = File::Spec->catfile("$tmp", 'counter');
 my $workers_log    = File::Spec->catfile("$tmp", 'workers');
@@ -244,7 +238,7 @@ get '/fail-recover' => sub {
 
 app->config(hypnotoad => {
 	listen           => ["http://127.0.0.1:$ENV{MPB_PORT}"],
-	workers          => 3,
+	workers          => $ENV{MPB_HYPNOTOAD_WORKERS} // 3,
 	spare            => 0,
 	pid_file         => "$ENV{MPB_TMP}/hypnotoad.pid",
 	graceful_timeout => 2,
@@ -261,65 +255,30 @@ sub stop_server {
 	return unless $server_pid;
 	my $pid = $server_pid;
 	$server_pid = 0;
-	return unless $server_group;
-
-	kill('TERM', -$pid);
-	my $deadline = Time::HiRes::time() + 3;
-	while (Time::HiRes::time() < $deadline) {
-		last unless kill(0, -$pid);
-		Time::HiRes::sleep(0.1);
-	}
-	kill('KILL', -$pid) if kill(0, -$pid);
-	waitpid($pid, WNOHANG);
+	stop_group($pid, $server_group);
 
 	return;
 }
 
 END { stop_server() }
 
-pipe(my $ready_reader, my $ready_writer) or die "Cannot create a pipe: $!";
-$server_pid = fork;
-defined($server_pid) or die "Cannot fork: $!";
-
-if (!$server_pid) {
-	close($ready_reader);
-	open(STDIN, '<', File::Spec->devnull) or POSIX::_exit(1);
-	open(STDOUT, '>', $log) or POSIX::_exit(1);
-	open(STDERR, '>&', STDOUT) or POSIX::_exit(1);
-
-	if (POSIX::setsid() < 0) {
-		print STDERR "setsid failed: $!\n";
-		POSIX::_exit(1);
-	}
-	print {$ready_writer} "1";
-	close($ready_writer);
-
-	$ENV{MPB_PORT}           = $port;
-	$ENV{MPB_TMP}            = "$tmp";
-	$ENV{MPB_CACHE_DIR}      = $cache_dir;
-	$ENV{MPB_LOCK_DIR}       = $lock_dir;
-	$ENV{MPB_COUNTER}        = $counter;
-	$ENV{MPB_WORKERS}        = $workers_log;
-	$ENV{MPB_STUCK_MARKER}   = $stuck_marker;
-	$ENV{MPB_RELEASE_MARKER} = $release_marker;
-	$ENV{MPB_DIE_MARKER}     = $die_marker;
-	$ENV{MPB_FAIL_MARKER}    = $fail_marker;
-	$ENV{MPB_FAIL_RELEASE}   = $fail_release;
-	$ENV{MPB_TIMEOUT_LOG}    = $timeout_log;
-	$ENV{PERL5LIB}       = join(':', $lib, grep { defined($_) && length($_) } ($ENV{PERL5LIB} // ''));
-	$ENV{HYPNOTOAD_FOREGROUND} = 1;
-	delete @ENV{qw(HYPNOTOAD_EXE HYPNOTOAD_APP HYPNOTOAD_PID HYPNOTOAD_REV)};
-
-	exec($^X, $hypnotoad, '-f', $app) or do {
-		print STDERR "exec failed: $!\n";
-		POSIX::_exit(1);
-	};
-}
-
-close($ready_writer);
-my $ready_byte = <$ready_reader>;
-close($ready_reader);
-$server_group = defined($ready_byte) && ($ready_byte eq '1');
+my $server = spawn_hypnotoad(
+	log                => $log,
+	MPB_PORT           => $port,
+	MPB_TMP            => "$tmp",
+	MPB_CACHE_DIR      => $cache_dir,
+	MPB_LOCK_DIR       => $lock_dir,
+	MPB_COUNTER        => $counter,
+	MPB_WORKERS        => $workers_log,
+	MPB_STUCK_MARKER   => $stuck_marker,
+	MPB_RELEASE_MARKER => $release_marker,
+	MPB_DIE_MARKER     => $die_marker,
+	MPB_FAIL_MARKER    => $fail_marker,
+	MPB_FAIL_RELEASE   => $fail_release,
+	MPB_TIMEOUT_LOG    => $timeout_log,
+);
+$server_pid   = $server->{pid};
+$server_group = $server->{group};
 
 if (!$server_group) {
 	waitpid($server_pid, 0);
@@ -330,19 +289,7 @@ if (!$server_group) {
 }
 
 my $base = "http://127.0.0.1:$port";
-my $ua   = Mojo::UserAgent->new(connect_timeout => 1, request_timeout => 2);
-my $ready = 0;
-my $deadline = Time::HiRes::time() + 15;
-while (Time::HiRes::time() < $deadline) {
-	my $tx = $ua->get("$base/ping" => {Connection => 'close'});
-	if ($tx->res && $tx->res->is_success && ($tx->res->code == 200)) {
-		$ready = 1;
-		last;
-	}
-	last unless kill(0, -$server_pid);
-	Time::HiRes::sleep(0.1);
-}
-undef $ua;
+my $ready = wait_for_ready($base, $server_pid);
 
 if (!$ready) {
 	fail(failure_message('hypnotoad did not become ready'));
@@ -362,42 +309,21 @@ my $client = Mojo::UserAgent->new(
 # A worker can accept several connections before its event loop starts the
 # first of them, so the pool is free to hand every connection in a batch to
 # one worker.  When that happens no cross-worker coalescing took place, which
-# says nothing about the plugin, so try again with a fresh cache key instead
-# of failing on the scheduler.  Each extra attempt costs about a second.
-my (@tx, @ids, $error, $round, $spread, %handled, %builds);
-for my $attempt (1 .. 3) {
-	$round = $attempt;
-	@ids   = map { "r$attempt-$_" } 1 .. 6;
-	@tx    = ();
-	$error = undef;
+# says nothing about the plugin, so the batch is retried with a fresh cache
+# key instead of failing on the scheduler.  Each extra attempt costs about a
+# second; run_cold_batch() reports which attempt was used.
+my $batch = run_cold_batch(sub {
+	my $attempt = shift;
+	return request_cold_batch($client, $base, $workers_log, $attempt);
+});
 
-	Mojo::Promise->all(map {
-		$client->get_p("$base/cold?round=$attempt" => {Connection => 'close', 'X-Test-Id' => $_})
-	} @ids)
-		->then(sub { @tx = map { @$_ } @_ })
-		->catch(sub { $error = shift })
-		->wait;
-
-	%handled = %{log_entries($workers_log, "r$attempt-")};
-
-	# %handled is keyed by request id, so count the workers, not the entries
-	my %seen = map { $handled{$_} => 1 } keys %handled;
-	$spread = !defined($error) && (scalar(keys %seen) > 1);
-	last if $spread;
-
-	report_round("attempt $attempt of 3 discarded: "
-		. (defined($error)
-			? "the batch failed: $error"
-			: 'all six connections reached one worker'));
-}
-
-report_round(
-	$spread
-	? ($round == 1
-		? 'the cold batch was spread over the pool on the first attempt'
-		: "the cold batch needed $round attempts before the pool spread it over more than one worker")
-	: 'no attempt spread the cold batch over the pool; cross-worker coalescing was not exercised'
-);
+my $round   = $batch->{round};
+my $spread  = $batch->{spread};
+my @ids     = @{$batch->{ids}};
+my @tx      = @{$batch->{tx}};
+my $error   = $batch->{error};
+my %handled = %{$batch->{handled}};
+my %builds;
 
 ok(!defined($error), 'all concurrent requests completed') or diag("Request failed: $error");
 is(scalar(@tx), 6, 'six responses');
@@ -623,6 +549,143 @@ is($rebuilt_tx->res ? $rebuilt_tx->res->body : undef, 'rebuilt after the failure
 my $rebuilt_again = $client->get("$base/fail-recover" => {Connection => 'close'});
 is($rebuilt_again->res->headers->header('X-Cache'), 'HIT', 'the rebuilt entry is replayed');
 
+subtest 'a single-worker pool is reported as three discarded attempts' => sub {
+	# Every connection to one worker is what a real pool looks like when its
+	# scheduling wins, so the fake supplies exactly that shape
+	my $calls = 0;
+	my ($log, $batch) = capture_stderr(sub {
+		run_cold_batch(sub {
+			$calls++;
+			my $attempt = shift;
+			my %handled = map { ("r$attempt-$_" => 4242) } 1 .. 6;
+			return {handled => \%handled};
+		});
+	});
+
+	is($calls, 3, 'the batch was tried three times');
+	ok(!$batch->{spread}, 'no attempt counted as spread over the pool');
+	is($batch->{round}, 3, 'the last attempt is the one reported by the assertions');
+
+	for my $attempt (1 .. 3) {
+		like($log,
+			qr/^# attempt $attempt of 3 discarded: all six connections reached one worker$/m,
+			"attempt $attempt is reported as discarded");
+	}
+	like($log, qr/^# no attempt spread the cold batch over the pool; cross-worker coalescing was not exercised$/m,
+		'the never-spread message is printed');
+	unlike($log, qr/spread over the pool on the first attempt|needed \d+ attempts/,
+		'no spread message is printed');
+
+	# A batch that fails is reported with the error rather than blamed on the pool
+	my ($failed_log) = capture_stderr(sub {
+		run_cold_batch(sub { {error => 'connection refused', handled => {}} });
+	});
+	like($failed_log, qr/^# attempt 1 of 3 discarded: the batch failed: connection refused$/m,
+		'a failed batch is reported with its error');
+};
+
+subtest 'the attempt that worked is reported' => sub {
+	my ($first_log, $first) = capture_stderr(sub {
+		run_cold_batch(sub { {handled => {a => 1, b => 2}} });
+	});
+	is($first->{round}, 1, 'a spread first attempt is used straight away');
+	like($first_log, qr/^# the cold batch was spread over the pool on the first attempt$/m,
+		'the first attempt is reported');
+
+	my ($second_log, $second) = capture_stderr(sub {
+		run_cold_batch(sub {
+			my $attempt = shift;
+			return {handled => $attempt == 1 ? {a => 1} : {a => 1, b => 2}};
+		});
+	});
+	is($second->{round}, 2, 'the second attempt is used once it spreads');
+	like($second_log, qr/^# the cold batch needed 2 attempts before the pool spread it over more than one worker$/m,
+		'the attempt that worked is reported');
+	like($second_log, qr/^# attempt 1 of 3 discarded: all six connections reached one worker$/m,
+		'the discarded attempt before it is reported');
+};
+
+# Opt-in, because it starts a second hypnotoad with one worker and then waits
+# out three one-second attempts.  Unset, the retry report is still covered
+# above by a fake pool; set, the same drill runs against a real pool that
+# cannot possibly spread a batch.
+subtest 'a live single-worker pool retries the cold batch' => sub {
+	plan skip_all => 'set MPB_LIVE_RETRY=1 to run the single-worker retry drill'
+		unless $ENV{MPB_LIVE_RETRY};
+
+	my $single_tmp   = File::Temp->newdir('mpb-single-XXXXXX', TMPDIR => 1);
+	my $single_cache = File::Spec->catdir("$single_tmp", 'cache');
+	my $single_locks = File::Spec->catdir("$single_tmp", 'locks');
+	mkdir($single_cache) or die "Cannot create $single_cache: $!";
+	mkdir($single_locks) or die "Cannot create $single_locks: $!";
+
+	my $single_port = free_port();
+	ok(defined($single_port), 'found a port for the single-worker server') or return;
+
+	my $single_counter = File::Spec->catfile("$single_tmp", 'counter');
+	my $single_workers = File::Spec->catfile("$single_tmp", 'workers');
+	my $single_log     = File::Spec->catfile("$single_tmp", 'hypnotoad.log');
+
+	my $single = spawn_hypnotoad(
+		log                   => $single_log,
+		MPB_PORT              => $single_port,
+		MPB_TMP               => "$single_tmp",
+		MPB_CACHE_DIR         => $single_cache,
+		MPB_LOCK_DIR          => $single_locks,
+		MPB_COUNTER           => $single_counter,
+		MPB_WORKERS           => $single_workers,
+		MPB_STUCK_MARKER      => File::Spec->catfile("$single_tmp", 'stuck.marker'),
+		MPB_RELEASE_MARKER    => File::Spec->catfile("$single_tmp", 'stuck.release'),
+		MPB_DIE_MARKER        => File::Spec->catfile("$single_tmp", 'die.marker'),
+		MPB_FAIL_MARKER       => File::Spec->catfile("$single_tmp", 'fail.marker'),
+		MPB_FAIL_RELEASE      => File::Spec->catfile("$single_tmp", 'fail.release'),
+		MPB_TIMEOUT_LOG       => File::Spec->catfile("$single_tmp", 'timeout.workers'),
+		MPB_HYPNOTOAD_WORKERS => 1,
+	);
+
+	my $single_base = "http://127.0.0.1:$single_port";
+	my $ready = $single->{group} && wait_for_ready($single_base, $single->{pid});
+	ok($ready, 'the single-worker server is ready')
+		or diag("Server log:\n" . read_file($single_log));
+
+	my ($report, $single_batch);
+	if ($ready) {
+		# Let the master finish forking its one worker
+		Time::HiRes::sleep(0.2);
+
+		($report, $single_batch) = capture_stderr(sub {
+			run_cold_batch(sub {
+				my $attempt = shift;
+				return request_cold_batch($client, $single_base, $single_workers, $attempt);
+			});
+		});
+	}
+
+	stop_group($single->{pid}, $single->{group});
+	undef $single_tmp;
+
+	return unless $ready;
+
+	ok(!$single_batch->{spread}, 'a single worker never counts as a spread batch');
+	is($single_batch->{round}, 3, 'all three attempts were used');
+
+	my %handling_pids = map { $_ => 1 } values %{$single_batch->{handled}};
+	is(scalar(keys %handling_pids), 1, 'every request was handled by the one worker')
+		or diag('workers: ' . join(', ', sort keys %handling_pids));
+
+	is_deeply([map { $_->res ? $_->res->code : 0 } @{$single_batch->{tx}}], [(200) x 6],
+		'the retried batch was served in full');
+
+	for my $attempt (1 .. 3) {
+		like($report, qr/^# attempt $attempt of 3 discarded: all six connections reached one worker$/m,
+			"attempt $attempt is reported as discarded");
+	}
+	like($report, qr/^# no attempt spread the cold batch over the pool; cross-worker coalescing was not exercised$/m,
+		'the never-spread message is reported');
+	unlike($report, qr/spread over the pool on the first attempt|needed \d+ attempts/,
+		'no spread message is reported');
+};
+
 stop_server();
 done_testing();
 
@@ -645,6 +708,171 @@ sub read_file {
 	close($fh);
 
 	return $content // '';
+}
+
+# A free loopback port, for a server that has to be started on its own
+sub free_port {
+	my $probe = IO::Socket::INET->new(
+		LocalAddr => '127.0.0.1',
+		LocalPort => 0,
+		Listen    => 1,
+		ReuseAddr => 1,
+	) or return undef;
+	my $port = $probe->sockport;
+	close($probe);
+
+	return $port;
+}
+
+# Starts a hypnotoad that owns its own process group, so the whole pool can be
+# stopped again.  %env is set in the child only, which is what lets a second
+# server run beside the first.
+sub spawn_hypnotoad {
+	my %env = @_;
+	my $server_log = delete $env{log};
+
+	pipe(my $ready_reader, my $ready_writer) or die "Cannot create a pipe: $!";
+	my $pid = fork;
+	defined($pid) or die "Cannot fork: $!";
+
+	if (!$pid) {
+		close($ready_reader);
+		open(STDIN, '<', File::Spec->devnull) or POSIX::_exit(1);
+		open(STDOUT, '>', $server_log) or POSIX::_exit(1);
+		open(STDERR, '>&', STDOUT) or POSIX::_exit(1);
+
+		if (POSIX::setsid() < 0) {
+			print STDERR "setsid failed: $!\n";
+			POSIX::_exit(1);
+		}
+		print {$ready_writer} "1";
+		close($ready_writer);
+
+		$ENV{$_} = $env{$_} for keys %env;
+		$ENV{PERL5LIB} = join(':', $lib, grep { defined($_) && length($_) } ($ENV{PERL5LIB} // ''));
+		$ENV{HYPNOTOAD_FOREGROUND} = 1;
+		delete @ENV{qw(HYPNOTOAD_EXE HYPNOTOAD_APP HYPNOTOAD_PID HYPNOTOAD_REV)};
+
+		exec($^X, $hypnotoad, '-f', $app) or do {
+			print STDERR "exec failed: $!\n";
+			POSIX::_exit(1);
+		};
+	}
+
+	close($ready_writer);
+	my $ready_byte = <$ready_reader>;
+	close($ready_reader);
+
+	return {pid => $pid, group => (defined($ready_byte) && ($ready_byte eq '1')) ? 1 : 0};
+}
+
+sub wait_for_ready {
+	my ($base, $pid) = @_;
+
+	my $ua       = Mojo::UserAgent->new(connect_timeout => 1, request_timeout => 2);
+	my $deadline = Time::HiRes::time() + 15;
+	while (Time::HiRes::time() < $deadline) {
+		my $tx = $ua->get("$base/ping" => {Connection => 'close'});
+		return 1 if $tx->res && $tx->res->is_success && ($tx->res->code == 200);
+		return 0 unless kill(0, -$pid);
+		Time::HiRes::sleep(0.1);
+	}
+
+	return 0;
+}
+
+sub stop_group {
+	my ($pid, $group) = @_;
+
+	return unless $pid && $group;
+
+	kill('TERM', -$pid);
+	my $deadline = Time::HiRes::time() + 3;
+	while (Time::HiRes::time() < $deadline) {
+		last unless kill(0, -$pid);
+		Time::HiRes::sleep(0.1);
+	}
+	kill('KILL', -$pid) if kill(0, -$pid);
+	waitpid($pid, WNOHANG);
+
+	return;
+}
+
+# Sends one attempt of six concurrent cold requests and reports what the
+# worker log said about them
+sub request_cold_batch {
+	my ($client, $base, $workers_log, $attempt) = @_;
+
+	my @ids = map { "r$attempt-$_" } 1 .. 6;
+	my (@tx, $error);
+
+	Mojo::Promise->all(map {
+		$client->get_p("$base/cold?round=$attempt" => {Connection => 'close', 'X-Test-Id' => $_})
+	} @ids)
+		->then(sub { @tx = map { @$_ } @_ })
+		->catch(sub { $error = shift })
+		->wait;
+
+	return {
+		ids     => \@ids,
+		tx      => \@tx,
+		error   => $error,
+		handled => log_entries($workers_log, "r$attempt-"),
+	};
+}
+
+# Runs the cold batch up to three times and reports on STDERR which attempt
+# was used.  $run is called with the attempt number and returns the ids, the
+# transactions, the request error and the worker log entries for that attempt,
+# so the loop can be driven from a fake pool as well as from a real one.
+sub run_cold_batch {
+	my $run = shift;
+
+	my ($round, $spread, %result);
+	for my $attempt (1 .. 3) {
+		$round   = $attempt;
+		my $batch = $run->($attempt);
+
+		# handled is keyed by request id, so count the workers, not the entries
+		my %seen = map { $batch->{handled}{$_} => 1 } keys %{$batch->{handled}};
+		$spread = !defined($batch->{error}) && (scalar(keys %seen) > 1);
+		%result = (%$batch, seen => \%seen);
+		last if $spread;
+
+		report_round("attempt $attempt of 3 discarded: "
+			. (defined($batch->{error})
+				? "the batch failed: $batch->{error}"
+				: 'all six connections reached one worker'));
+	}
+
+	report_round(
+		$spread
+		? ($round == 1
+			? 'the cold batch was spread over the pool on the first attempt'
+			: "the cold batch needed $round attempts before the pool spread it over more than one worker")
+		: 'no attempt spread the cold batch over the pool; cross-worker coalescing was not exercised'
+	);
+
+	return {%result, round => $round, spread => $spread};
+}
+
+# Returns what was written to STDERR while $code runs, and what it returned.
+# The glob is localised rather than duped, because an in-memory handle cannot
+# be opened directly as STDERR.
+sub capture_stderr {
+	my $code = shift;
+
+	my $output = '';
+	open(my $capture, '>', \$output) or die "Cannot capture stderr: $!";
+	my $result = eval {
+		local *STDERR = $capture;
+		$code->();
+	};
+	my $error = $@;
+	close($capture);
+	die $error if $error;
+
+	return ($output, $result);
 }
 
 # CI runs `prove -lr t/`, which only prints the TAP comments of a file that
