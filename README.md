@@ -1508,10 +1508,6 @@ is not negotiated from `Accept-Language`.
 [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis),
 [Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N)
 
-## AUTHOR
-
-Nigel Horne, `<njh at nigelhorne.com>`
-
 ## FORMAL SPECIFICATION
 
 This section describes the plugin in the Z notation, for readers who want
@@ -1827,11 +1823,14 @@ answer and changes nothing.
     / 304 Not Modified is sent with no body
 ```
 
-## LICENSE AND COPYRIGHT
+## AUTHOR
+
+Nigel Horne, `<njh at nigelhorne.com>`
+
+## LICENCE AND COPYRIGHT
 
 Copyright 2026 Nigel Horne.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the Free
-Software Foundation; either version 2 of the License, or (at your option)
-any later version.
+Usage is subject to the GPL2 licence terms.
+If you use it,
+please let me know.

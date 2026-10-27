@@ -212,8 +212,6 @@ Readonly::Array my @GROUP_OPTIONS => qw(compress_content optimise_content rewrit
 # Whether each optional module loads, remembered for the life of the process
 my %AVAILABLE;
 
-=encoding utf8
-
 =head1 NAME
 
 Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious responses
@@ -3360,9 +3358,7 @@ L<Mojolicious::Plugin>, L<Mojolicious::Plugin::Buffer::Lock::File>,
 L<Mojolicious::Plugin::Buffer::Lock::Redis>,
 L<Mojolicious::Plugin::Buffer::I18N>
 
-=head1 AUTHOR
-
-Nigel Horne, C<< <njh at nigelhorne.com> >>
+=encoding utf8
 
 =head1 FORMAL SPECIFICATION
 
@@ -3663,13 +3659,18 @@ This is the life of one cache key, seen by all workers together.
         on) and If-Modified-Since is not older than Last-Modified]
         / 304 Not Modified is sent with no body
 
-=head1 LICENSE AND COPYRIGHT
+=head1 AUTHOR
+
+Nigel Horne, C<< <njh at nigelhorne.com> >>
+
+=head1 LICENCE AND COPYRIGHT
 
 Copyright 2026 Nigel Horne.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the Free
-Software Foundation; either version 2 of the License, or (at your option)
-any later version.
+Usage is subject to the GPL2 licence terms.
+If you use it,
+please let me know.
 
 =cut
+
+1;
