@@ -4,6 +4,7 @@
 # Version control, CI and README generation
 ^\.git/
 ^\.pod2github\.ya?ml$
+^CLAUDE\.md$
 ^\.gitignore$
 ^\.github/
 \.gitignore$

@@ -1,0 +1,239 @@
+---
+# Hand-written jobs that App::GHGen does not generate.  They live in their
+# own file because "ghgen generate" rewrites perl-ci.yml from scratch;
+# this file is never regenerated, so edit it by hand.
+name: Extra CI
+
+"on":
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The live Redis lock test is skipped everywhere else, so this job keeps the
+  # claim that it passes with both clients from going stale.  Each client gets
+  # its own step, and each step proves from the test output which one ran.
+  live-redis:
+    name: Live Redis lock backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AUTOMATED_TESTING: 1
+      NONINTERACTIVE_TESTING: 1
+      MPB_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1.44.3
+        with:
+          perl-version: "5.40"
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v6
+        with:
+          path: ~/perl5
+          key: ${{ runner.os }}-perl-5.40-live-redis-${{ hashFiles('cpanfile') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-5.40-live-redis-
+
+      - name: Install cpanm and local::lib
+        run: cpanm --notest --local-lib=~/perl5 local::lib
+
+      - name: Install dependencies and Redis
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          cpanm --notest --installdeps .
+          cpanm --notest Redis Test::Without::Module
+
+      # Redis::Fast 0.39 bundles an old hiredis whose warnings are fatal under
+      # -Werror on modern compilers, so build it from a patched copy rather
+      # than letting cpanm fail the job
+      - name: Install Redis::Fast
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          mkdir -p "$RUNNER_TEMP/redis-fast"
+          cd "$RUNNER_TEMP/redis-fast"
+          info=$(cpanm --info Redis::Fast)
+          author=${info%%/*}
+          curl -fsSLO "https://cpan.metacpan.org/authors/id/${author:0:1}/${author:0:2}/$info"
+          tar xzf "${info#*/}"
+          sed -i 's/-Werror//g' Redis-Fast-*/deps/hiredis/Makefile
+          cpanm --notest ./Redis-Fast-*/
+
+      - name: Run the live test with Redis
+        id: redis-run
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          log="$RUNNER_TEMP/redis.log"
+          # The client notice is a diagnostic, which Test::More writes to
+          # STDERR outside a harness, so both streams have to be captured
+          perl -Ilib t/76-live-redis.t 2>&1 | tee "$log"
+          grep -q '^# the live Redis test is using Redis$' "$log"
+          grep -q 'the live Redis server is reachable' "$log"
+
+      - name: Run the live test with Redis::Fast only
+        id: redis-fast-run
+        env:
+          PERL5OPT: -MTest::Without::Module=Redis
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          # Fail if Redis is still loadable, so this really is the fallback path
+          perl -MTest::Without::Module=Redis \
+            -e 'exit(eval { require Redis; 1 } ? 1 : 0)'
+          log="$RUNNER_TEMP/redis-fast.log"
+          perl -Ilib t/76-live-redis.t 2>&1 | tee "$log"
+          grep -q '^# the live Redis test is using Redis::Fast$' "$log"
+          grep -q 'the live Redis server is reachable' "$log"
+
+      # Runs even when a test step failed, so a red job says which client was
+      # reached instead of leaving the only evidence in the raw log
+      - name: Summarise the clients used
+        if: always()
+        run: |
+          client_of() {
+            if [ -f "$1" ]; then
+              awk '/^# the live Redis test is using / {
+                     sub(/^# the live Redis test is using /, ""); print; exit
+                   }' "$1"
+            fi
+            return 0
+          }
+          tests_of() {
+            if [ -f "$1" ]; then
+              awk '/^1\.\.[0-9]+$/ { plan = $0 } END { print plan ? substr(plan, 4) : "-" }' "$1"
+            else
+              echo '-'
+            fi
+            return 0
+          }
+          redis_log="$RUNNER_TEMP/redis.log"
+          fast_log="$RUNNER_TEMP/redis-fast.log"
+          redis_client=$(client_of "$redis_log")
+          fast_client=$(client_of "$fast_log")
+
+          {
+            echo '### Live Redis lock backend'
+            echo
+            echo "Server: \`${MPB_REDIS_URL}\`"
+            echo
+            echo '| Run | Client reported by the test | Tests | Outcome |'
+            echo '| --- | --- | --- | --- |'
+            echo "| with Redis | ${redis_client:-not reported} | $(tests_of "$redis_log") | ${{ steps.redis-run.outcome }} |"
+            echo "| Redis::Fast only | ${fast_client:-not reported} | $(tests_of "$fast_log") | ${{ steps.redis-fast-run.outcome }} |"
+            echo
+            if [ -z "$redis_client" ] || [ -z "$fast_client" ]; then
+              echo 'A client shown as `not reported` produced no client notice: the run never reached the test body, so read that step log.'
+            else
+              echo 'Each client is read from the test output, so the row describes the run rather than the modules installed.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The matrix below only uses current Perls and the newest CPAN releases.
+  # This job installs the oldest versions Makefile.PL accepts, so a declared
+  # minimum cannot drift away from what the code really needs.
+  minimum-versions:
+    name: Minimum Perl and dependency versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUTOMATED_TESTING: 1
+      NO_NETWORK_TESTING: 1
+      NONINTERACTIVE_TESTING: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1.44.3
+        with:
+          perl-version: "5.26"
+
+      - name: Install the minimum versions
+        run: |
+          cpanm --notest --local-lib=~/perl5 local::lib
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          # Keep these in step with MIN_PERL_VERSION and PREREQ_PM.
+          # Readonly is not pinned: 2.00 is no longer downloadable, so the
+          # current release is used.
+          cpanm --notest \
+            SRI/Mojolicious-9.0.tar.gz \
+            Params::Get@0.17 \
+            Params::Validate::Strict@0.41 \
+            Return::Set@0.05 \
+            Sub::Private@0.07 \
+            Sub::Protected@0.03
+          cpanm --notest --installdeps .
+
+      - name: Check the pinned versions were not upgraded
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          perl -MMojolicious -e 'exit($Mojolicious::VERSION == 9.0 ? 0 : 1)'
+
+      - name: Run tests
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          prove -lr t/
+
+  # t/pod.t, t/pod-coverage.t and t/schemas.t skip in the generated matrix
+  # unless their tools happen to be installed; this job installs them, so
+  # the POD and its API SPECIFICATION blocks are always checked.
+  author-tests:
+    name: POD and schema checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUTOMATED_TESTING: 1
+      NO_NETWORK_TESTING: 1
+      NONINTERACTIVE_TESTING: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1.44.3
+        with:
+          perl-version: "5.42"
+
+      - name: Cache CPAN modules
+        uses: actions/cache@v6
+        with:
+          path: ~/perl5
+          key: ${{ runner.os }}-perl-5.42-author-${{ hashFiles('cpanfile') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-5.42-author-
+
+      - name: Install dependencies and the checking tools
+        run: |
+          cpanm --notest --local-lib=~/perl5 local::lib
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          cpanm --notest --installdeps .
+          cpanm --notest Test::Pod Test::Pod::Coverage
+          # t/schemas.t skips when extract-schemas is missing, so a failed
+          # install of this larger tool does not fail the job
+          cpanm --notest App::Test::Generator || true
+
+      - name: Run the POD and schema tests
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          prove -l t/pod.t t/pod-coverage.t t/schemas.t
