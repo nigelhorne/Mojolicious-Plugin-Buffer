@@ -93,3 +93,20 @@ Revision history for Mojolicious-Plugin-Buffer
 	Add a runnable grouped-sections example under eg/grouped-sections, with
 	one section declared on an under route and one in a controller, and a
 	test that runs it and asserts both declarations.
+	Stop optimise_content cutting UTF-8 characters in half: under Mojo::Base
+	\s also matched the bytes \xA0 and \x85, so "voila" with a grave accent
+	lost its last byte.  Every pattern in the plugin is now ASCII-only.
+	Refuse undef for encodings, compressible_types, excluded_types, vary_by
+	and min_compress_size at registration (vary_by => undef silently dropped
+	Cookie from the cache key), and accept undef without a warning where it
+	means the default, including cache_lock_timeout and the Redis ttl check.
+	Hash cache keys as UTF-8 bytes in both lock backends and in the
+	generated and template-mtime keys, so a custom cache_key containing an
+	emoji no longer makes every acquire die and quietly lose cross-worker
+	locking.
+	Rewrite the POD for beginners and ESL readers: several SYNOPSIS
+	patterns, plain-words explanations and glossaries, COMMON PITFALLS and
+	ENCODING sections, API SPECIFICATION blocks for the attributes, the Z
+	specifications gathered into FORMAL SPECIFICATION, and ASCII STATE
+	DIAGRAMs for every module.  Correct the Last-Modified performance advice:
+	an explicit epoch does not stop the template scan made by cache lookups.

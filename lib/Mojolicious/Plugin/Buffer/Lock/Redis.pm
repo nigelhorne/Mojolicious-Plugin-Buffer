@@ -7,7 +7,7 @@ use autodie qw(:all);
 use Mojo::Base -base;
 
 use Carp qw(croak);
-use Mojo::Util qw(md5_sum trim);
+use Mojo::Util qw(encode md5_sum trim);
 use Mojolicious::Plugin::Buffer::I18N qw(i18n);
 use Params::Get qw(get_params);
 use Params::Validate::Strict qw(validate_strict);
@@ -31,7 +31,7 @@ Readonly::Scalar my $MIN_TTL_MS => 1;
 # dispatches commands through AUTOLOAD and has no eval() for can() to find.
 Readonly::Hash my %NEW_SCHEMA => (
 	namespace => {type => 'string', min => 1},
-	ttl => {type => 'number', matches => qr/^\d+(?:\.\d+)?$/, callback => sub { $_[0] > 0 }},
+	ttl => {type => 'number', matches => qr/^\d+(?:\.\d+)?$/, callback => sub { defined($_[0]) && ($_[0] > 0) }},
 );
 
 has redis     => undef;
@@ -72,67 +72,197 @@ Version 0.001.0
 
 =head1 SYNOPSIS
 
+Workers on several machines, sharing one Redis server and one cache:
+
+    use Mojolicious::Lite;
+    use CHI;
     use Redis;
     use Mojolicious::Plugin::Buffer::Lock::Redis;
 
+    plugin 'Buffer' => {
+	cache => CHI->new(driver => 'Memcached', servers => ['cache.internal:11211']),
+	cache_lock => Mojolicious::Plugin::Buffer::Lock::Redis->new(
+	    # A code reference: each worker makes its own connection
+	    redis => sub {
+		Redis->new(
+		    server        => 'redis.internal:6379',
+		    cnx_timeout   => 1,
+		    read_timeout  => 1,
+		    write_timeout => 1,
+		);
+	    },
+	    namespace => 'myapp:buffer:',
+	    ttl       => 60,
+	),
+    };
+
+The same with L<Redis::Fast>, which has the same interface:
+
+    use Redis::Fast;
+
     my $lock = Mojolicious::Plugin::Buffer::Lock::Redis->new(
-	redis => sub {
-	    Redis->new(
-		server       => 'redis://127.0.0.1:6379',
-		read_timeout => 1,
-	    );
-	},
-	namespace => 'myapp:buffer:',
-	ttl       => 60,
+	redis => sub { Redis::Fast->new(server => 'redis.internal:6379') },
     );
 
-    my ($guard, $error) = $lock->acquire($key);
-    ...
-    $lock->release($guard);
+Use it on its own, for example so that only one machine runs a job:
+
+    my ($guard, $error) = $lock->acquire('nightly-report');
+    if ($guard) {
+	build_report();
+	$lock->release($guard);
+    } elsif (defined $error) {
+	warn "Redis problem: $error\n";
+    }    # else another machine is already doing it
+
+Add a Redis Cluster hash tag by overriding the protected C<_key> method, so
+every lock lands in one slot:
+
+    package MyApp::Lock;
+    use Mojo::Base 'Mojolicious::Plugin::Buffer::Lock::Redis';
+    use Mojo::Util qw(encode md5_sum);
+
+    sub _key {
+	my ($self, $key) = @_;
+	return '{' . $self->namespace . '}' . md5_sum(encode('UTF-8', $key));
+    }
 
 =head1 DESCRIPTION
 
-A distributed lock backend for L<Mojolicious::Plugin::Buffer/cache_lock>, so
-workers on different hosts can elect a single builder for a missing cache
+This is a lock backend for
+L<cache_lock|Mojolicious::Plugin::Buffer/cache_lock>.  It lets workers on
+I<different machines> agree that only one of them builds a missing cache
 entry.  The cache itself must also be shared between those workers.
 
-Locks are set with C<SET ... NX PX>, which is atomic.  The value is a unique
-token per acquisition, and release uses a small Lua script to delete the key
-only when it still contains that token.  A lock also expires after
-L</ttl> seconds, so a crashed worker cannot block the key for ever.
+=head2 How it works, in plain words
 
-The Redis client is called synchronously, before the action is allowed to
-continue, so it must not use a non-blocking API.  Set connect, read and write
-timeouts on the client; a slow Redis server delays the request.  Redis 2.6.12
-or newer is required for C<SET ... NX PX>.
+=over 4
+
+=item 1. Each cache key is turned into a Redis key: L</namespace> followed by
+the MD5 digest of the cache key.
+
+=item 2. To take the lock, the backend writes a random I<token> into that
+Redis key, but only if the key does not exist yet (Redis C<SET ... NX PX>).
+Redis does this in one step, so two workers can never both succeed.
+
+=item 3. The Redis key expires by itself after L</ttl> seconds.  So if a
+worker crashes while it holds a lock, the lock disappears later on its own.
+
+=item 4. To release the lock, a small Lua script deletes the Redis key, but
+only if it still holds I<our> token.  If our lock already expired and another
+worker took it, we do not delete theirs.
+
+=back
+
+The Redis client is called I<synchronously>: the worker waits for Redis to
+answer before the request goes on.  So set short connect, read and write
+timeouts on the client, and do not use a non-blocking client.  Redis 2.6.12
+or newer is needed for C<SET ... NX PX>.
+
+=head2 Words used in this document
+
+=over 4
+
+=item token
+
+A random 32-character string made for each successful L</acquire>.  It
+proves which worker owns a lock.
+
+=item TTL
+
+"Time to live": how long Redis keeps the lock before it deletes it by
+itself.
+
+=item guard
+
+The value L</acquire> returns when you get the lock.  It holds the Redis key
+and the token.  Give it back to L</release>.
+
+=back
 
 =head1 ATTRIBUTES
 
+Attributes are set with L</new>, which checks them.  Each one also has an
+accessor method with the same name, made by L<Mojo::Base>.  Changing a value
+through the accessor after L</new> skips those checks.
+
 =head2 redis
 
-A Redis client object with the same C<eval($script, $numkeys, @args)> method
-as L<Redis> and L<Redis::Fast>, or a code reference that returns one.  The
-code reference is called lazily, once per worker, and is the safe choice for
-pre-forking servers: a client object created in C<startup> is inherited by
-every worker and must not be used.  Required.
+Required.  Either a Redis client object with the same
+C<eval($script, $numkeys, @args)> method as L<Redis> and L<Redis::Fast>, or
+a code reference that returns such an object.
+
+Prefer the code reference.  It is called the first time this backend is
+used in each process, so with a pre-forking server such as L<hypnotoad>
+every worker gets its own connection.  A client object made in C<startup>
+is copied into every worker by C<fork>, and the workers would then share
+one network connection, which corrupts the replies.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    # An object is accepted when it can('eval') or has an AUTOLOAD, as the
+    # CPAN Redis client dispatches its commands through AUTOLOAD
+    { redis => { type => ['coderef', 'object'], optional => 1 } }
+
+=head4 Output
+
+    # Return::Set schema: the value when reading, the object when writing
+    { type => ['coderef', 'object'] }
 
 =head2 namespace
 
-Prefix for the Redis keys, defaults to C<'buffer:lock:'>.  The rest of the
-key is an MD5 digest of the cache key.  Use a different namespace for each
-application sharing a Redis database.
+The prefix for every Redis key this backend makes.  Defaults to
+C<'buffer:lock:'>.  Use a different namespace for each application that
+shares a Redis database.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    { namespace => { type => 'string', min => 1, optional => 1 } }
+
+=head4 Output
+
+    # Return::Set schema: the value when reading, the object when writing
+    { type => 'string', min => 1 }
 
 =head2 ttl
 
-How long an acquired lock lives, in seconds, defaults to 60.  It should be
-longer than L<Mojolicious::Plugin::Buffer/cache_lock_timeout> and longer than
-the slowest action that uses the cache.  If it expires while the builder is
-still working, another worker can start building the same entry.
+How long a lock lives, in seconds.  Defaults to 60.  Fractions such as
+C<0.5> are allowed; the value is sent to Redis in whole milliseconds, and
+never less than 1 millisecond.  Choose a value longer than
+L<cache_lock_timeout|Mojolicious::Plugin::Buffer/cache_lock_timeout> and
+longer than your slowest cached action.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    { ttl => { type => 'number', min => 0, optional => 1,
+               matches => qr/^\d+(?:\.\d+)?$/ } }   # and > 0
+
+=head4 Output
+
+    # Return::Set schema: the value when reading, the object when writing
+    { type => 'number' }
 
 =head2 messages
 
-An optional hash of message overrides, see
-L<Mojolicious::Plugin::Buffer::I18N>.
+An optional hash of message overrides.  See
+L<Mojolicious::Plugin::Buffer::I18N> for the keys and the text format.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    { messages => { type => 'hashref', optional => 1 } }
+
+=head4 Output
+
+    # Return::Set schema: the hash (or undef) when reading, the object
+    # when writing
+    { type => 'hashref', optional => 1 }
 
 =head1 METHODS
 
@@ -213,17 +343,6 @@ None.
 
 All three croak.
 
-=head3 FORMAL SPECIFICATION
-
-    ┌─ NewRedisLock ──────────────────────────────
-    │ redis? : Client ∪ (seq₀ ARG → Client)
-    │ namespace? : seq₁ CHAR ; ttl? : ℝ
-    │ result! : RedisLock
-    ├─────────────────────────────────────────────
-    │ ttl? > 0
-    │ result!.namespace = namespace? ∧ result!.ttl = ttl?
-    └─────────────────────────────────────────────
-
 =cut
 
 sub new {
@@ -252,7 +371,8 @@ Try, without waiting, to become the only worker building C<$key>.
 
 =item C<$key> (positional, required)
 
-The cache key, any defined string.
+The cache key: any defined string, in any language, emoji included.  Only
+its MD5 digest is sent to Redis.
 
 =back
 
@@ -261,7 +381,7 @@ The cache key, any defined string.
 C<($guard, undef)> when the lock was acquired, C<(undef, undef)> when
 another worker holds it, and C<(undef, $error)> when Redis is unavailable.
 The plugin logs an error and continues without a cross-worker lock in the
-last case.
+last case.  Call it in list context; see L</COMMON PITFALLS>.
 
 =head3 Side effects
 
@@ -300,20 +420,6 @@ expires after L</ttl>.
     redis_no_result     Redis lock command returned no result     Check the client library
 
 These are returned, not thrown.
-
-=head3 FORMAL SPECIFICATION
-
-    ┌─ AcquireRedis ──────────────────────────────
-    │ ΔRedis
-    │ key? : KEY ; guard! : Guard ∪ {⊥} ; error! : TEXT ∪ {⊥}
-    ├─────────────────────────────────────────────
-    │ let k == namespace ⁀ md5(key?) •
-    │   k ∉ dom store ∧ reachable ⇒
-    │       store′ = store ⊕ {k ↦ token} ∧ expiry′ k = now + ttl
-    │       ∧ guard! = (k, token) ∧ error! = ⊥
-    │   k ∈ dom store ⇒ store′ = store ∧ guard! = ⊥ ∧ error! = ⊥
-    │   ¬reachable ⇒ store′ = store ∧ guard! = ⊥ ∧ error! ≠ ⊥
-    └─────────────────────────────────────────────
 
 =head3 PSEUDOCODE
 
@@ -404,16 +510,6 @@ Deletes the Redis key if it still holds the token.
     redis_invalid_guard  invalid lock guard            Pass the guard acquire returned
     redis_unlock_failed  Redis unlock failed: ERROR    None needed; the TTL expires it
 
-=head3 FORMAL SPECIFICATION
-
-    ┌─ ReleaseRedis ──────────────────────────────
-    │ ΔRedis
-    │ guard? : Guard ; ok! : 𝔹
-    ├─────────────────────────────────────────────
-    │ store guard?.key = guard?.token ⇒ store′ = {guard?.key} ⩤ store
-    │ store guard?.key ≠ guard?.token ⇒ store′ = store
-    └─────────────────────────────────────────────
-
 =cut
 
 sub release {
@@ -469,7 +565,8 @@ sub _client :Protected {
 sub _key :Protected {
 	my ($self, $key) = @_;
 
-	return $self->namespace . md5_sum($key);
+	# md5_sum dies on characters above 255, so hash the UTF-8 bytes
+	return $self->namespace . md5_sum(encode('UTF-8', $key));
 }
 
 # Purpose:        Produce a token that no other acquisition will share.
@@ -507,6 +604,76 @@ sub _valid :Private {
 
 1;
 
+=head1 COMMON PITFALLS
+
+=over 4
+
+=item * B<Always take both return values.>  L</acquire> returns a list of
+two values.  In scalar context Perl gives you only the I<last> one, the
+error slot:
+
+    my $guard = $lock->acquire($key);           # WRONG: $guard is undef
+    my ($guard, $error) = $lock->acquire($key); # right
+
+Here the mistake is costly.  The lock I<was> taken in Redis, but you have
+lost the token, so you cannot release it.  Every worker then sees "busy" for
+that key until the L</ttl> runs out.
+
+=item * B<The TTL is too short.>  If the builder is still working when the
+lock expires, a second worker can take the lock and build the same entry.
+Make L</ttl> longer than the slowest action that uses the cache.
+
+=item * B<A client object made before the fork.>  Pass a code reference as
+L</redis>, not an object made in C<startup>.  Also, do not call L</acquire>
+in C<startup>: the first call stores the client, and C<fork> would then copy
+it into every worker.
+
+=item * B<A slow Redis server slows every cached request.>  The call waits
+for Redis.  Set C<cnx_timeout>, C<read_timeout> and C<write_timeout> on the
+client.
+
+=item * B<Changing attributes after C<new>.>  C<< $lock->ttl(0) >> is not
+checked; Redis is then sent the smallest TTL, 1 millisecond, and the lock
+protects nothing.  Set attributes with L</new> only.
+
+=item * B<The lock is not re-entrant.>  A second C<acquire> for a key this
+worker already holds returns "busy" C<(undef, undef)>.
+
+=item * B<undef values.>  C<acquire(undef)> returns
+C<(undef, 'cache key is not defined')>.  C<release(undef)> returns
+C<(0, 'invalid lock guard')>.  A factory that returns C<undef> gives
+C<(undef, 'Redis lock failed: Redis client factory returned no client')>,
+and is asked again on the next call.  C<< new(ttl =E<gt> undef) >> and
+C<< new(namespace =E<gt> undef) >> croak.
+
+=back
+
+=head1 ENCODING
+
+=over 4
+
+=item Keys
+
+Any Perl string is safe, including accented letters, other non-ASCII text
+and emoji.  The key is encoded as UTF-8 bytes and hashed, so only an ASCII
+digest is sent to Redis.  A subclass that overrides C<_key> must encode
+before calling C<md5_sum>, which dies on a character above U+00FF.
+
+=item namespace
+
+Sent to Redis as part of the key.  Keep it ASCII.  Redis keys are bytes, so
+a non-ASCII namespace must be encoded to bytes by you first.
+
+=item messages
+
+Override texts may hold any characters, including emoji.  The messages this
+module returns are Perl character strings; print them through an encoding
+layer such as C<:encoding(UTF-8)>, or Perl warns "Wide character".
+L<Mojo::Log> encodes to UTF-8 by itself.  The text after C<ERROR> comes from
+the Redis client and is passed on unchanged.
+
+=back
+
 =head1 LIMITATIONS
 
 =over 4
@@ -534,6 +701,131 @@ L<Mojolicious::Plugin::Buffer::I18N>.
 =head1 AUTHOR
 
 Nigel Horne, C<< <njh at bandsman.co.uk> >>
+
+=head1 FORMAL SPECIFICATION
+
+This section describes the backend in the Z notation, for readers who want
+an exact model.  You do not need it to use the module.  C<store> is the part
+of the Redis database that this backend uses, C<expiry> says when each of
+its keys disappears, and C<now> is the current time.
+
+    [KEY, TEXT, TOKEN, Client]
+
+    rkey : KEY → TEXT
+    ∀ k : KEY • rkey k = namespace ⁀ md5(utf8(k))
+
+    Guard == TEXT × TOKEN
+
+    ┌─ Redis ─────────────────────────────────────
+    │ namespace : seq₁ CHAR
+    │ ttl : ℝ
+    │ client : Client ∪ {⊥}
+    │ store : TEXT ⇸ TOKEN
+    │ expiry : TEXT ⇸ ℝ
+    ├─────────────────────────────────────────────
+    │ ttl > 0
+    │ dom expiry = dom store
+    └─────────────────────────────────────────────
+
+    ┌─ Expire ────────────────────────────────────
+    │ ΔRedis
+    ├─────────────────────────────────────────────
+    │ store′ = { r : dom store | expiry r ≤ now } ⩤ store
+    │ expiry′ = { r : dom store | expiry r ≤ now } ⩤ expiry
+    └─────────────────────────────────────────────
+
+=head2 new
+
+    ┌─ NewRedisLock ──────────────────────────────
+    │ Redis′
+    │ redis? : Client ∪ (seq ARG → Client)
+    │ namespace? : seq₁ CHAR ; ttl? : ℝ
+    │ result! : Redis
+    ├─────────────────────────────────────────────
+    │ ttl? > 0
+    │ namespace′ = namespace? ∧ ttl′ = ttl?
+    │ client′ = ⊥ ⇐ redis? is a code reference
+    │ result! = θRedis′
+    └─────────────────────────────────────────────
+    -- No connection is made.  Any violated predicate: croak.
+
+=head2 acquire
+
+C<reachable> means the client could be made and answered.  C<token> is
+fresh: it differs from every token issued before.
+
+    ┌─ AcquireRedis ──────────────────────────────
+    │ ΔRedis
+    │ key? : KEY ; token : TOKEN
+    │ guard! : Guard ∪ {⊥} ; error! : TEXT ∪ {⊥}
+    ├─────────────────────────────────────────────
+    │ let r == rkey key? •
+    │   reachable ∧ r ∉ dom store ⇒
+    │       store′ = store ⊕ {r ↦ token}
+    │       ∧ expiry′ = expiry ⊕ {r ↦ now + max(ttl, 0.001)}
+    │       ∧ guard! = (r, token) ∧ error! = ⊥
+    │   reachable ∧ r ∈ dom store ⇒
+    │       store′ = store ∧ guard! = ⊥ ∧ error! = ⊥
+    │   ¬reachable ⇒
+    │       store′ = store ∧ guard! = ⊥ ∧ error! ≠ ⊥
+    └─────────────────────────────────────────────
+
+=head2 release
+
+    ┌─ ReleaseRedis ──────────────────────────────
+    │ ΔRedis
+    │ guard? : Guard ∪ {⊥} ; ok! : 𝔹 ; error! : TEXT ∪ {⊥}
+    ├─────────────────────────────────────────────
+    │ guard? = ⊥ ⇒ store′ = store ∧ ok! = false ∧ error! ≠ ⊥
+    │ guard? = (r, t) ∧ store r = t ⇒
+    │     store′ = {r} ⩤ store ∧ ok! = true
+    │ guard? = (r, t) ∧ (r ∉ dom store ∨ store r ≠ t) ⇒
+    │     store′ = store ∧ ok! = true
+    │ ¬reachable ⇒ store′ = store ∧ ok! = false ∧ error! ≠ ⊥
+    └─────────────────────────────────────────────
+
+=head1 STATE DIAGRAM
+
+Each cache key's lock, as Redis sees it.  The numbers on the arrows are
+explained below the picture.
+
+       +-----------+            (1)              +----------------+
+       |   FREE    | --------------------------> |  HELD (token)  |
+       |  (key k)  | <-------------------------- |                |
+       +-----------+          (2) or (3)         +----------------+
+          |     ^                                    |     ^
+          +-----+ (4)                                +-----+ (5), (6)
+
+    (1) acquire(k)  [Redis answers and the key is absent]
+        / SET key token NX PX ttl; returns ({key, token}, undef)
+    (2) release(guard)  [the stored token matches the guard]
+        / the Lua script deletes the key; returns (1, undef)
+    (3) the TTL runs out
+        / Redis deletes the key by itself.  If the holder is still
+          building, a second worker can now start building as well.
+    (4) acquire(k)  [Redis is unreachable, or the factory gave no client]
+        / returns (undef, error); nothing changes
+    (5) acquire(k)  [the key is present], from any worker, the holder too
+        / returns (undef, undef); nothing changes
+    (6) release(old guard)  [the token differs: this lock expired and
+        another worker took the key]
+        / nothing is deleted; returns (1, undef)
+
+The backend object itself has one more state, for its client:
+
+       +----------------+   first acquire() or release() in this process
+       | NO CLIENT YET  |   [redis is a code reference]          +---------+
+       | (after new)    | -------------------------------------> | CLIENT  |
+       +----------------+   / call the factory once; keep result | READY   |
+              |   ^                                              +---------+
+              +---+  the factory returned undef or died
+                     / the call returns (undef, error); try again next time
+
+When L</redis> is an object rather than a code reference, the backend
+starts in CLIENT READY.
+
+The plugin's own use of these states is drawn in
+L<Mojolicious::Plugin::Buffer/STATE DIAGRAM>.
 
 =head1 LICENSE AND COPYRIGHT
 

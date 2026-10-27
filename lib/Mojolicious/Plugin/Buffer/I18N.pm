@@ -137,55 +137,152 @@ Version 0.001.0
 
 =head1 SYNOPSIS
 
-    # Inside a class of this distribution
-    use Mojolicious::Plugin::Buffer::I18N qw(i18n);
+Translate the text that visitors see when the server is busy (an
+application using L<Mojolicious::Plugin::Buffer>):
 
-    croak $self->i18n('unknown_option', {option => 'wibble'});
-
-    # Rewording or translating messages from an application
     plugin 'Buffer' => {
 	messages => {
 	    retry_later => "Die Seite wird erstellt, bitte versuchen Sie es erneut.\n",
 	},
     };
 
+Reword a log line, keeping its plural forms.  Give I<every> form, because an
+override replaces the whole message:
+
+    plugin 'Buffer' => {
+	messages => {
+	    log_compressed => {
+		one   => 'packed %{from} -> %{to} byte (%{encoding})',
+		other => 'packed %{from} -> %{to} bytes (%{encoding})',
+	    },
+	},
+    };
+
+Use a code reference for a language whose plural rules need more than
+C<zero>, C<one> and C<other>, such as Polish:
+
+    plugin 'Buffer' => {
+	messages => {
+	    log_optimised => sub {
+		my $args = shift;
+		my $n = $args->{count};
+		my $word = $n == 1 ? 'bajt'
+		    : ($n % 10 >= 2 && $n % 10 <= 4 && ($n % 100 < 10 || $n % 100 >= 20)) ? 'bajty'
+		    : 'bajtow';
+		return "Buffer: HTML z %{from} do %{to} $word";
+	    },
+	},
+    };
+
+Use the catalog in your own class.  The method reads the overrides from the
+C<messages> key of the object:
+
+    package My::Thing;
+    use Mojolicious::Plugin::Buffer::I18N qw(i18n);
+
+    sub new { my ($class, %args) = @_; return bless {messages => $args{messages}}, $class }
+
+    my $thing = My::Thing->new(messages => {unknown_option => q{No such option: %{option}}});
+    print $thing->i18n('unknown_option', {option => 'wibble'});
+    # No such option: wibble
+
+List every key, for example to start a translation:
+
+    my $catalog = Mojolicious::Plugin::Buffer::I18N->catalog;
+    print "$_\n" for sort keys %$catalog;
+
 =head1 DESCRIPTION
 
 Every error, warning, log line and client-facing string produced by
 L<Mojolicious::Plugin::Buffer> and its lock backends is looked up here by a
-message key, so none of them is hard-coded in the logic.  An application can
-replace any of them with the C<messages> option of the plugin, or the
-C<messages> attribute of a lock backend.
+I<message key>, so none of them is written into the program logic.  An
+application can replace any of them with the C<messages> option of the
+plugin, or the C<messages> attribute of a lock backend.
+
+=head2 How it works, in plain words
+
+=over 4
+
+=item 1. The program asks for a message by its key, for example
+C<unknown_option>, and passes some values, for example
+C<< {option =E<gt> 'wibble'} >>.
+
+=item 2. The object's own C<messages> hash is checked first.  If it has the
+key, that text is used.  If not, the built-in English text is used.
+
+=item 3. If the text has several forms (for plural or gender), the right
+form is chosen from the C<count> and C<gender> values.
+
+=item 4. Each placeholder, such as C<%{option}>, is replaced by its value.
+
+=item 5. If anything goes wrong (an unknown key, a missing form, a code
+reference that dies), the key itself is returned.  So you always see
+I<something>, never an empty message.
+
+=back
+
+=head2 Words used in this document
+
+=over 4
+
+=item key
+
+The name of a message, for example C<retry_later>.  Keys are ASCII words.
+
+=item template
+
+The text stored for a key, before placeholders are filled in.
+
+=item placeholder
+
+A marker in a template, written C<%{name}>, that is replaced by a value.
+
+=item variant
+
+One form of a message that has several forms, such as the singular form
+C<one> and the plural form C<other>.
+
+=back
 
 =head2 Templates
 
-A message is one of:
+A template is one of these three things:
 
 =over 4
 
 =item a string
 
-Placeholders are written C<%{name}>, or C<%{name:FORMAT}> where C<FORMAT> is a
-single C<sprintf> conversion such as C<%d>, C<%5.1f> or C<%x>.  A placeholder
-whose argument was not supplied is left in the text unchanged, so a missing
-argument is visible rather than silently blank.  An argument that is present
-but undefined becomes the empty string.
+Placeholders are written C<%{name}>, or C<%{name:FORMAT}> where C<FORMAT> is
+a single C<sprintf> conversion such as C<%d>, C<%5.1f> or C<%x>.  A
+placeholder whose argument was not supplied is left in the text unchanged,
+so a missing argument is visible rather than silently blank.  An argument
+that is present but undefined becomes the empty string.
 
 =item a hash of variants
 
-Used for pluralisation and grammatical gender.  If the C<gender> argument
-names a key of the hash, that variant is used.  Otherwise, if a numeric
-C<count> argument is given, C<zero> is used for 0 and C<one> for 1 when
-those keys exist, and C<other> for everything else.  Without either argument
-C<other> is used.  Variants may nest, e.g. gender variants whose values are
-plural variants.
+Used for plurals and grammatical gender.  The rules are tried in this
+order:
+
+=over 4
+
+=item 1. If the C<gender> argument is a key of the hash, that variant is
+used.
+
+=item 2. Otherwise, if C<count> is a number: C<zero> is used for 0 and
+C<one> for 1, when those keys exist.
+
+=item 3. Otherwise C<other> is used.
+
+=back
+
+Variants may be nested, for example gender variants whose values are plural
+variants.  Nesting stops after 4 levels.
 
 =item a code reference
 
-Called with the argument hash and returning a string or a hash of variants.
-This is the escape hatch for languages whose plural rules cannot be expressed
-with C<zero>, C<one> and C<other>.  If it dies, the message key is used
-instead.
+Called with the argument hash.  It returns a string or a hash of variants.
+Use it for languages whose plural rules cannot be written with C<zero>,
+C<one> and C<other>.  If it dies, the message key is used instead.
 
 =back
 
@@ -274,36 +371,6 @@ All three croak.  The last two come from L<Params::Validate::Strict> and are
 not translated, because they report a programming error in the caller
 rather than a condition a user can act on.
 
-=head3 FORMAL SPECIFICATION
-
-    [KEY, TEXT, VALUE]
-
-    Template ::= str⟨⟨TEXT⟩⟩ | variants⟨⟨NAME ⇸ Template⟩⟩ | code⟨⟨Args → Template⟩⟩
-    Args == NAME ⇸ VALUE
-
-    ┌─ Catalog ───────────────────────────────────
-    │ defaults : KEY ⇸ Template
-    │ overrides : KEY ⇸ Template
-    └─────────────────────────────────────────────
-
-    ┌─ I18n ──────────────────────────────────────
-    │ ΞCatalog
-    │ key? : KEY ; args? : Args ; text! : TEXT
-    ├─────────────────────────────────────────────
-    │ let t == (defaults ⊕ overrides)(key?) •
-    │   key? ∈ dom (defaults ⊕ overrides) ∧ select(t, args?) ≠ ⊥
-    │     ⇒ text! = interpolate(select(t, args?), args?)
-    │   key? ∉ dom (defaults ⊕ overrides) ∨ select(t, args?) = ⊥
-    │     ⇒ text! = key?
-    └─────────────────────────────────────────────
-
-    select(variants v, a) = select(v(gender a), a)      if gender a ∈ dom v
-                          = select(v(zero), a)          if count a = 0 ∧ zero ∈ dom v
-                          = select(v(one), a)           if count a = 1 ∧ one ∈ dom v
-                          = select(v(other), a)         otherwise
-    select(code f, a)     = select(f(a), a)
-    select(str s, a)      = s
-
 =head3 PSEUDOCODE
 
     croak if there is no key
@@ -386,15 +453,6 @@ None.
 
 None.
 
-=head3 FORMAL SPECIFICATION
-
-    ┌─ Catalog_Copy ──────────────────────────────
-    │ ΞCatalog
-    │ result! : KEY ⇸ Template
-    ├─────────────────────────────────────────────
-    │ result! = defaults
-    └─────────────────────────────────────────────
-
 =cut
 
 sub catalog {
@@ -470,6 +528,77 @@ sub _interpolate :Private {
 
 1;
 
+=head1 COMMON PITFALLS
+
+=over 4
+
+=item * B<An override replaces the whole message; it is not merged.>  If the
+built-in message has C<one> and C<other> forms and you override it with a
+plain string, both forms are replaced by that one string.  If you override
+it with C<< {other =E<gt> '...'} >> only, there is no C<one> form any more.
+Give every form you need.
+
+=item * B<undef is not "use the default".>  C<< messages =E<gt>
+{retry_later =E<gt> undef} >> makes the message the bare key, so visitors
+see the word C<retry_later>.  To go back to the built-in text, I<delete> the
+key from the hash instead.
+
+=item * B<A missing argument stays visible.>  C<i18n('unknown_option')>
+without C<option> returns C<... unknown option '%{option}'>.  This is on
+purpose, so that a mistake shows.  An argument that I<exists> but is undef
+becomes the empty string.
+
+=item * B<There is no escape for a literal C<%{name}>.>  If a translated
+text must show C<%{word}> itself, do not pass an argument called C<word>.
+A plain C<%> that is not followed by C<{> is always left alone.
+
+=item * B<Gender is checked before count.>  With both C<gender> and C<count>
+given, a matching gender variant wins.  Put the plural forms I<inside> the
+gender variant if you need both.
+
+=item * B<A code reference that dies is silent.>  The key is returned
+instead, and no warning is given.  Test your code references.
+
+=item * B<A format is one conversion only.>  C<%{n:%d}> works.  C<%{n:%d%%}>
+does not match the placeholder rule and is left in the text unchanged.  The
+conversions C<%n> and vector flags are refused on purpose.
+
+=item * B<Messages are chosen once per application.>  The plugin does not
+read C<Accept-Language>.  See L</LIMITATIONS>.
+
+=back
+
+=head1 ENCODING
+
+=over 4
+
+=item Templates and arguments
+
+Both may hold any Perl characters: accented letters, any other script, and
+emoji.  Use C<use utf8;> in a source file that contains such characters
+literally, or write them as escapes like C<"\x{1F600}">.  A C<%{name:%5s}>
+width counts characters, not bytes.
+
+=item The returned text
+
+The result is a Perl character string.  It is not encoded.  When you print
+it, use a handle with an encoding layer, such as
+C<binmode(STDOUT, ':encoding(UTF-8)')>, or Perl warns "Wide character".
+L<Mojo::Log> encodes every line to UTF-8 by itself, so log lines are safe.
+The plugin encodes the C<retry_later> text to UTF-8 and sends it with
+C<charset=UTF-8>.
+
+=item Keys
+
+Keys are matched exactly.  All built-in keys are ASCII; use ASCII for your
+own keys too.
+
+=item Messages from Params::Validate::Strict
+
+These are English and are passed through unchanged.
+
+=back
+
 =head1 LIMITATIONS
 
 =over 4
@@ -495,6 +624,105 @@ L<Mojolicious::Plugin::Buffer>
 =head1 AUTHOR
 
 Nigel Horne, C<< <njh at bandsman.co.uk> >>
+
+=head1 FORMAL SPECIFICATION
+
+This section describes the catalog in the Z notation, for readers who want
+an exact model.  You do not need it to use the module.  C<defaults> is the
+built-in English catalog and C<overrides> is the C<messages> hash of the
+object the method is called on.
+
+    [KEY, TEXT, NAME, VALUE]
+
+    Args == NAME ⇸ VALUE
+    Template ::= str⟨⟨TEXT⟩⟩ | variants⟨⟨NAME ⇸ Template⟩⟩ | code⟨⟨Args → Template⟩⟩
+
+    ┌─ Catalog ───────────────────────────────────
+    │ defaults : KEY ⇸ Template
+    │ overrides : KEY ⇸ Template
+    └─────────────────────────────────────────────
+
+    select : Template × Args × ℕ ⇸ TEXT ∪ {⊥}
+
+    select(t, a, d)           = ⊥                       if d ≥ 4 ∧ t ∉ ran str
+    select(str s, a, d)       = s
+    select(code f, a, d)      = select(f(a), a, d + 1)  if f(a) does not die
+                              = ⊥                       otherwise
+    select(variants v, a, d)  = select(v(pick(v, a)), a, d + 1)
+                                                        if pick(v, a) ∈ dom v
+                              = ⊥                       otherwise
+
+    pick(v, a) = gender a   if gender a ∈ dom v
+               = zero       if count a = 0 ∧ zero ∈ dom v
+               = one        if count a = 1 ∧ one ∈ dom v
+               = other      otherwise
+
+=head2 i18n
+
+C<interpolate> replaces each placeholder C<%{n}> or C<%{n:F}> for which
+C<n ∈ dom args?>, and leaves every other placeholder unchanged.
+
+    ┌─ I18n ──────────────────────────────────────
+    │ ΞCatalog
+    │ key? : KEY ; args? : Args ; text! : TEXT
+    ├─────────────────────────────────────────────
+    │ key? ≠ ∅
+    │ let m == defaults ⊕ overrides •
+    │   key? ∈ dom m ∧ select(m key?, args?, 0) ≠ ⊥
+    │     ⇒ text! = interpolate(select(m key?, args?, 0), args?)
+    │   key? ∉ dom m ∨ select(m key?, args?, 0) = ⊥
+    │     ⇒ text! = key?
+    └─────────────────────────────────────────────
+    -- key? undefined or empty, or args? not a hash: croak
+
+=head2 catalog
+
+    ┌─ Catalog_Copy ──────────────────────────────
+    │ ΞCatalog
+    │ result! : KEY ⇸ Template
+    ├─────────────────────────────────────────────
+    │ result! = defaults
+    └─────────────────────────────────────────────
+
+=head1 STATE DIAGRAM
+
+This module keeps no state between calls: the catalog never changes while
+the program runs, and the overrides belong to the calling object.  So
+instead of states, this diagram shows the path one call to L</i18n> takes.
+Each box is a step; the text on an arrow is the condition for taking it.
+
+     i18n(key, args)
+          |
+          v
+     +--------------------+  key undef or empty,
+     | 1. CHECK ARGUMENTS |  or args not a hash
+     |                    | ----------------------> croak
+     +--------------------+
+          | ok
+          v
+     +--------------------+  key in neither hash
+     | 2. LOOK UP THE KEY | ----------------------> return the key
+     | overrides first,   |                         (e.g. "retry_later")
+     | then the defaults  |
+     +--------------------+
+          | found
+          v
+     +--------------------+  undef template, dying
+     | 3. RESOLVE         |  code ref, no variant
+     | code ref: call it  |  fits, or 4 levels deep
+     | hash: pick variant | ----------------------> return the key
+     | repeat until plain |
+     +--------------------+
+          | plain string
+          v
+     +--------------------+
+     | 4. FILL IN         |  This step cannot fail.  A placeholder
+     | %{name} and        |  with no argument is left as it is.
+     | %{name:FORMAT}     |
+     +--------------------+
+          |
+          v
+     return the text
 
 =head1 LICENSE AND COPYRIGHT
 

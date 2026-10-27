@@ -214,4 +214,22 @@ subtest 'last_modified forms' => sub {
 	}
 };
 
+# Params::Validate::Strict accepts undef for any type, so the plugin decides:
+# undef is refused where it would quietly change behaviour (vary_by => undef
+# would drop the Cookie header from the cache key) and accepted, without a
+# warning, where it means "use the default"
+subtest 'undef is only accepted where it means the default' => sub {
+	for my $name (qw(encodings compressible_types excluded_types vary_by min_compress_size)) {
+		eval { Mojolicious->new->plugin('Buffer', $name => undef) };
+		like($@, qr/\Q$name\E must be/, "$name => undef is rejected");
+	}
+
+	my @warnings;
+	local $SIG{__WARN__} = sub { push @warnings, @_ };
+	for my $name (qw(cache cache_key cache_duration cache_lock_timeout last_modified template_mtime_cache_duration messages)) {
+		ok(eval { Mojolicious->new->plugin('Buffer', $name => undef); 1 }, "$name => undef is accepted") or diag($@);
+	}
+	is(scalar(@warnings), 0, 'and nothing warns') or diag(@warnings);
+};
+
 done_testing();

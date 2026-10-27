@@ -10,7 +10,7 @@ use Carp qw(croak);
 use Fcntl qw(:flock O_CREAT O_RDWR);
 use File::Path ();
 use File::Spec ();
-use Mojo::Util qw(md5_sum trim);
+use Mojo::Util qw(encode md5_sum trim);
 use Mojolicious::Plugin::Buffer::I18N qw(i18n);
 use Params::Get qw(get_params);
 use Params::Validate::Strict qw(validate_strict);
@@ -41,40 +41,158 @@ Version 0.001.0
 
 =head1 SYNOPSIS
 
+The usual way: give the plugin a directory and let it build this backend.
+
+    use Mojolicious::Lite;
+    use CHI;
+
+    plugin 'Buffer' => {
+	cache          => CHI->new(driver => 'File', root_dir => '/var/cache/myapp'),
+	cache_lock_dir => '/var/lib/myapp/buffer-locks',
+    };
+
+Build the backend yourself, for example to reword its messages, and pass it
+as C<cache_lock>:
+
     use Mojolicious::Plugin::Buffer::Lock::File;
 
     my $lock = Mojolicious::Plugin::Buffer::Lock::File->new(
-	dir => '/var/lib/myapp/buffer-locks',
+	dir      => '/var/lib/myapp/buffer-locks',
+	messages => {lock_failed => 'lock %{path} is broken: %{error}'},
     );
+    plugin 'Buffer' => {cache => $cache, cache_lock => $lock};
 
-    my ($guard, $error) = $lock->acquire($key);
-    ...
+Use it on its own, for example so that only one copy of a cron job rebuilds
+a report at a time:
+
+    use Mojolicious::Plugin::Buffer::Lock::File;
+
+    my $lock = Mojolicious::Plugin::Buffer::Lock::File->new(dir => '/run/myapp');
+
+    # Always take BOTH return values (see COMMON PITFALLS)
+    my ($guard, $error) = $lock->acquire('nightly-report');
+    die "$error\n" if defined $error;
+    exit 0 unless $guard;    # another copy is already running
+
+    build_report();
     $lock->release($guard);
+
+Spread the lock files over sub-directories by overriding the protected
+C<_path> method in a subclass:
+
+    package MyApp::Lock;
+    use Mojo::Base 'Mojolicious::Plugin::Buffer::Lock::File';
+    use File::Path ();
+    use File::Spec ();
+    use Mojo::Util qw(encode md5_sum);
+
+    sub _path {
+	my ($self, $key) = @_;
+	my $digest = md5_sum(encode('UTF-8', $key));
+	my $sub = File::Spec->catdir($self->dir, substr($digest, 0, 2));
+	File::Path::make_path($sub);
+	return File::Spec->catfile($sub, "$digest.lock");
+    }
 
 =head1 DESCRIPTION
 
-The built-in lock backend used by
-L<Mojolicious::Plugin::Buffer/cache_lock_dir>.  It takes a non-blocking
-exclusive C<flock> on one small, empty file per cache key, so a lock is
-released automatically if the process dies.  Lock files are not removed, but
-they are tiny and can be deleted while the application is stopped.
+This is the built-in lock backend for L<Mojolicious::Plugin::Buffer>.  The
+plugin uses it when you set
+L<cache_lock_dir|Mojolicious::Plugin::Buffer/cache_lock_dir>.
 
-All workers must share the directory.  Use
-L<Mojolicious::Plugin::Buffer::Lock::Redis> instead when the workers are on
-different hosts.
+=head2 What problem does it solve?
+
+A web server often runs several copies of your program at the same time.
+Each copy is called a I<worker>.  When a page is not in the cache yet, every
+worker that gets a request for it would build the same page at the same
+time.  That wastes work.  A I<lock> lets exactly one worker build the page.
+The other workers wait, then read the finished page from the cache.
+
+=head2 How it works, in plain words
+
+=over 4
+
+=item 1. Each cache key gets its own small, empty file in L</dir>.  The file
+name is the MD5 digest of the key, so any key makes a safe file name.
+
+=item 2. To take the lock, the backend opens that file and asks the operating
+system for an exclusive lock on it (C<flock>).  It does not wait: if another
+open file handle already holds the lock, the answer is "busy" at once.
+
+=item 3. The lock lasts as long as the file stays open.  The open file lives
+inside the I<guard> that L</acquire> returns.
+
+=item 4. L</release> closes the file, which frees the lock.  If the process
+crashes or is killed, the operating system closes the file and frees the
+lock too.  So a dead worker can never block a key for ever.
+
+=back
+
+All workers must use the same directory.  This works for workers on one
+machine.  For workers on different machines, use
+L<Mojolicious::Plugin::Buffer::Lock::Redis>.
+
+=head2 Words used in this document
+
+=over 4
+
+=item key
+
+A text string that names one cache entry, for example C<buffer:0123abcd>.
+
+=item guard
+
+The value L</acquire> returns when you get the lock.  Keep it, and give it
+back to L</release>.  Do not look inside it.
+
+=item flock
+
+The operating system's file-locking call.  Only one open file handle can
+hold an exclusive C<flock> on a file at a time.
+
+=back
 
 =head1 ATTRIBUTES
 
+Attributes are set with L</new>.  Each one also has an accessor method with
+the same name, made by L<Mojo::Base>.
+
 =head2 dir
 
-The directory holding the lock files.  It is created if necessary and must be
-writable.  Required.
+The directory that holds the lock files.  It is required.  L</new> creates it
+(and any missing parent directories) and checks that it is writable.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    # $lock->dir reads the value.  $lock->dir($path) changes it WITHOUT
+    # creating or checking the directory; see COMMON PITFALLS.
+    { dir => { type => 'string', min => 1, optional => 1 } }
+
+=head4 Output
+
+    # Return::Set schema: the path when reading, the object when writing
+    { type => 'string' }
 
 =head2 messages
 
-An optional hash of message overrides, see
-L<Mojolicious::Plugin::Buffer::I18N>.  The plugin passes its own C<messages>
-option here when it builds this backend from C<cache_lock_dir>.
+An optional hash of message overrides, keyed by message key.  See
+L<Mojolicious::Plugin::Buffer::I18N> for the keys and the text format.  The
+plugin passes its own C<messages> option here when it builds this backend
+from C<cache_lock_dir>.
+
+=head3 API SPECIFICATION
+
+=head4 Input
+
+    { messages => { type => 'hashref', optional => 1 } }
+
+=head4 Output
+
+    # Return::Set schema: the hash (or undef) when reading, the object
+    # when writing
+    { type => 'hashref', optional => 1 }
 
 =head1 METHODS
 
@@ -142,19 +260,6 @@ Creates C<dir> and any missing parents.
 All three croak.  The OS error is Perl's C<$!> text and follows the
 process's C<LC_MESSAGES> only inside C<use locale>.
 
-=head3 FORMAL SPECIFICATION
-
-    [PATH]
-    ┌─ New ───────────────────────────────────────
-    │ dir? : PATH ; fs, fs′ : PATH ⇸ Node ; result! : FileLock
-    ├─────────────────────────────────────────────
-    │ dir? ≠ ∅
-    │ dir? ∈ dom fs′ ∧ isDirectory(fs′ dir?) ∧ writable(fs′ dir?)
-    │ fs ⊆ fs′
-    │ result!.dir = dir?
-    └─────────────────────────────────────────────
-    -- Otherwise: croak, and fs′ may hold the parents created so far
-
 =cut
 
 sub new {
@@ -193,8 +298,8 @@ Try, without waiting, to become the only process building C<$key>.
 
 =item C<$key> (positional, required)
 
-The cache key, any defined string.  Only its MD5 digest reaches the
-filesystem.
+The cache key: any defined string, in any language, emoji included.  Only
+its MD5 digest reaches the file system.
 
 =back
 
@@ -203,7 +308,8 @@ filesystem.
 A two-element list, as the lock protocol in
 L<Mojolicious::Plugin::Buffer/cache_lock> requires: C<($guard, undef)> when
 the lock was taken, C<(undef, undef)> when another process holds it, and
-C<(undef, $error)> on failure.  The guard is opaque.
+C<(undef, $error)> on failure.  The guard is opaque.  Call it in list
+context; see L</COMMON PITFALLS>.
 
 =head3 Side effects
 
@@ -250,18 +356,6 @@ guard lives.
                                                        flock; use another backend
 
 These are returned, not thrown.
-
-=head3 FORMAL SPECIFICATION
-
-    ┌─ Acquire ───────────────────────────────────
-    │ ΔLocks
-    │ key? : KEY ; guard! : Guard ∪ {⊥} ; error! : TEXT ∪ {⊥}
-    ├─────────────────────────────────────────────
-    │ key? ∉ dom held ∧ ok ⇒ held′ = held ⊕ {key? ↦ self}
-    │                       ∧ guard! ≠ ⊥ ∧ error! = ⊥
-    │ key? ∈ dom held ⇒ held′ = held ∧ guard! = ⊥ ∧ error! = ⊥
-    │ ¬ok ⇒ held′ = held ∧ guard! = ⊥ ∧ error! ≠ ⊥
-    └─────────────────────────────────────────────
 
 =head3 PSEUDOCODE
 
@@ -357,16 +451,6 @@ Unlocks and closes the lock file handle and removes it from the guard.
     unlock_failed  cannot unlock PATH: OS ERROR   Usually harmless: closing
                                                   the handle drops the lock
 
-=head3 FORMAL SPECIFICATION
-
-    ┌─ Release ───────────────────────────────────
-    │ ΔLocks
-    │ guard? : Guard ∪ {⊥} ; ok! : 𝔹 ; error! : TEXT ∪ {⊥}
-    ├─────────────────────────────────────────────
-    │ held′ = held ⩥ {self}  restricted to key(guard?)
-    │ ok! = true ⇔ error! = ⊥
-    └─────────────────────────────────────────────
-
 =cut
 
 sub release {
@@ -389,7 +473,8 @@ sub release {
 sub _path :Protected {
 	my ($self, $key) = @_;
 
-	return File::Spec->catfile($self->dir, md5_sum($key) . $LOCK_FILE_SUFFIX);
+	# md5_sum dies on characters above 255, so hash the UTF-8 bytes
+	return File::Spec->catfile($self->dir, md5_sum(encode('UTF-8', $key)) . $LOCK_FILE_SUFFIX);
 }
 
 # Purpose:        Check that a value can name the lock directory.
@@ -417,6 +502,94 @@ sub _os_error :Private {
 
 1;
 
+=head1 COMMON PITFALLS
+
+=over 4
+
+=item * B<Always take both return values.>  L</acquire> returns a list of
+two values.  In scalar context Perl gives you only the I<last> one, which is
+the error slot:
+
+    my $guard = $lock->acquire($key);           # WRONG: $guard is undef
+    my ($guard, $error) = $lock->acquire($key); # right
+
+The wrong form is worse than it looks.  The real guard is thrown away at
+once, which closes the file, so the lock you just took is released before
+the next line runs.
+
+=item * B<Keep the guard while you work.>  The lock lives inside the guard.
+If the guard variable goes out of scope, the file is closed and the lock is
+freed, even though you never called L</release>.
+
+=item * B<The lock is not re-entrant.>  If your own process already holds
+the lock for a key, a second C<acquire> for the same key returns "busy"
+C<(undef, undef)>.  This is true even for the same object, because each call
+opens a new file handle.
+
+=item * B<Forking while you hold a lock shares it.>  A child process made
+with C<fork> inherits the open file, so the lock stays held until the parent
+I<and> the child have closed it.  Release locks before you fork.
+
+=item * B<Do not change C<dir> after C<new>.>  L</new> creates and checks the
+directory.  Setting it later with C<< $lock->dir($path) >> skips both checks,
+so a typing mistake only shows up as an error from every L</acquire>.
+
+=item * B<Lock files are never deleted.>  There is one empty file per key
+that was ever built.  Deleting a file while another process has it open
+would let two builders run, so only clean the directory while the
+application is stopped.
+
+=item * B<Network file systems.>  C<flock> is unreliable on some network
+file systems, especially older NFS.  Use
+L<Mojolicious::Plugin::Buffer::Lock::Redis> when workers are on different
+machines.
+
+=item * B<undef values.>  C<acquire(undef)> does not die; it returns
+C<(undef, 'cache key is not defined')>.  The empty string is a valid key.
+C<release(undef)> and releasing the same guard twice both return
+C<(1, undef)> and do nothing.  C<< new(dir =E<gt> undef) >> croaks.
+C<< messages =E<gt> undef >> means "no overrides".
+
+=back
+
+=head1 ENCODING
+
+=over 4
+
+=item Keys
+
+Any Perl string is safe, including accented letters, any other non-ASCII
+text and emoji.  The key is encoded as UTF-8 bytes before it is hashed, so
+the same characters always name the same lock file, however Perl stores
+them internally.  Only the MD5 digest reaches the file system.  A subclass
+that overrides C<_path> must do the same, because C<md5_sum> dies on a
+character above U+00FF.
+
+=item dir
+
+A directory name goes to the operating system as bytes.  An ASCII path is
+always safe.  For a non-ASCII path, pass a byte string that is already
+encoded the way your file system expects, usually UTF-8:
+
+    use Encode qw(encode);
+    my $lock = Mojolicious::Plugin::Buffer::Lock::File->new(
+	dir => encode('UTF-8', "/srv/caf\x{e9}/locks"),
+    );
+
+=item messages
+
+Override texts may hold any characters, including emoji.  The messages this
+module returns are Perl character strings.  Print them to a handle with an
+encoding layer, such as C<binmode(STDERR, ':encoding(UTF-8)')>, or Perl
+warns "Wide character".  L<Mojo::Log> encodes to UTF-8 by itself.
+
+=item Operating-system errors
+
+The text after C<OS ERROR> in a message is Perl's C<$!>.  It is English
+unless the program runs under C<use locale>.
+
+=back
+
 =head1 LIMITATIONS
 
 =over 4
@@ -442,6 +615,111 @@ L<Mojolicious::Plugin::Buffer::I18N>.
 =head1 AUTHOR
 
 Nigel Horne, C<< <njh at bandsman.co.uk> >>
+
+=head1 FORMAL SPECIFICATION
+
+This section describes the backend in the Z notation, for readers who want
+an exact model.  You do not need it to use the module.  C<KEY> is the set of
+cache keys, C<PATH> the set of file names and C<PID> the set of processes.
+C<held> records which process holds the lock for each key.
+
+    [KEY, PATH, PID, TEXT, Guard]
+
+    file : KEY → PATH
+    ∀ k : KEY • file k = dir ⁀ "/" ⁀ md5(utf8(k)) ⁀ ".lock"
+
+    ┌─ Locks ─────────────────────────────────────
+    │ dir : PATH
+    │ held : KEY ⇸ PID
+    ├─────────────────────────────────────────────
+    │ dir ≠ ∅
+    └─────────────────────────────────────────────
+
+    ┌─ ProcessExit ───────────────────────────────
+    │ ΔLocks
+    │ p? : PID
+    ├─────────────────────────────────────────────
+    │ held′ = held ⩥ {p?}
+    └─────────────────────────────────────────────
+
+=head2 new
+
+    ┌─ New ───────────────────────────────────────
+    │ Locks′
+    │ dir? : PATH ; fs, fs′ : PATH ⇸ Node ; result! : Locks
+    ├─────────────────────────────────────────────
+    │ dir? ≠ ∅
+    │ dir? ∈ dom fs′ ∧ isDirectory(fs′ dir?) ∧ writable(fs′ dir?)
+    │ fs ⊆ fs′
+    │ dir′ = dir? ∧ held′ = ∅ ∧ result! = θLocks′
+    └─────────────────────────────────────────────
+    -- Otherwise: croak, and fs′ may hold the parents created so far
+
+=head2 acquire
+
+C<ok> means the lock file could be opened and the file system supports
+C<flock>.  The lock is not re-entrant: when C<held key? = me> the result is
+"busy", the same as for any other holder.
+
+    ┌─ Acquire ───────────────────────────────────
+    │ ΔLocks
+    │ key? : KEY ; me : PID
+    │ guard! : Guard ∪ {⊥} ; error! : TEXT ∪ {⊥}
+    ├─────────────────────────────────────────────
+    │ ok ∧ key? ∉ dom held ⇒
+    │     held′ = held ⊕ {key? ↦ me} ∧ guard! ≠ ⊥ ∧ error! = ⊥
+    │ ok ∧ key? ∈ dom held ⇒
+    │     held′ = held ∧ guard! = ⊥ ∧ error! = ⊥
+    │ ¬ok ⇒
+    │     held′ = held ∧ guard! = ⊥ ∧ error! ≠ ⊥
+    └─────────────────────────────────────────────
+
+=head2 release
+
+    ┌─ Release ───────────────────────────────────
+    │ ΔLocks
+    │ guard? : Guard ∪ {⊥} ; ok! : 𝔹 ; error! : TEXT ∪ {⊥}
+    ├─────────────────────────────────────────────
+    │ guard? ≠ ⊥ ⇒ held′ = {key(guard?)} ⩤ held
+    │ guard? = ⊥ ⇒ held′ = held ∧ ok! = true
+    │ ok! = true ⇔ error! = ⊥
+    └─────────────────────────────────────────────
+    -- The lock is gone even when ok! = false, because the handle is closed
+
+=head1 STATE DIAGRAM
+
+Each cache key's lock is in one of two states.  The backend object itself
+has no other state: after L</new> it is ready, and it stays ready.  The
+numbers on the arrows are explained below the picture.
+
+       +-----------+            (1)              +-----------+
+       |   FREE    | --------------------------> |   HELD    |
+       |  (key k)  | <-------------------------- |  (key k)  |
+       +-----------+       (2), (3) or (4)       +-----------+
+          |     ^                                    |     ^
+          +-----+ (5), (7)                           +-----+ (6), (8)
+
+    (1) acquire(k)  [the file opens and flock is granted]
+        / returns (guard, undef); the file stays open inside the guard
+    (2) release(guard)
+        / unlock and close the file; returns (1, undef), or (0, error)
+          if unlocking failed - the lock is gone either way
+    (3) the guard goes out of scope
+        / Perl closes the file, which frees the lock
+    (4) the holding process exits or is killed
+        / the operating system closes the file, which frees the lock
+    (5) acquire(k)  [the file cannot be opened, or flock is not supported]
+        / returns (undef, error); nothing changes
+    (6) acquire(k)  [flock would block], from ANY process, the holder too
+        / returns (undef, undef); nothing changes
+    (7) release(undef), or release of a guard already released
+        / returns (1, undef); nothing changes
+    (8) fork()
+        / the child shares the open file, so the key stays HELD until
+          both processes have closed it
+
+The plugin's own use of these states is drawn in
+L<Mojolicious::Plugin::Buffer/STATE DIAGRAM>.
 
 =head1 LICENSE AND COPYRIGHT
 

@@ -8,14 +8,15 @@ Version 0.001.0
 
 ## Synopsis
 
+### 1. The Smallest Set-Up
+
+One line gives every page compression, an `ETag`, a `Last-Modified`
+header and `304 Not Modified` answers:
+
 ```perl
-# Mojolicious::Lite
 use Mojolicious::Lite;
 
-plugin 'Buffer' => {
-    optimise_content => 1,
-    compress_content => 1,
-};
+plugin 'Buffer';
 
 get '/' => sub {
     my $c = shift;
@@ -25,80 +26,228 @@ get '/' => sub {
 app->start;
 ```
 
-The same plugin in a full Mojolicious application:
+### 2. Smaller HTML
+
+Also remove extra white space from HTML pages.  Install [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker) to
+remove comments and shrink embedded CSS as well:
+
+```perl
+plugin 'Buffer' => {optimise_content => 1};
+```
+
+### 3. A Server-Side Cache for Slow Pages
+
+Keep finished pages in a cache, so a slow action runs once and later
+visitors get the stored copy.  Call the helper _first_ in the action, but
+_after_ any check that decides who may see the page:
+
+```perl
+use CHI;
+
+plugin 'Buffer' => {cache => CHI->new(driver => 'File', root_dir => '/var/cache/myapp')};
+
+get '/report' => sub {
+    my $c = shift;
+
+    # Access checks come first: a cached page is sent without them
+    return $c->reply->not_found unless $c->session('user');
+
+    return if $c->buffer_is_cached;    # sent from the cache: stop here
+
+    $c->render(text => slow_report());  # only runs on a miss
+};
+```
+
+### 4. Several Workers on One Machine
+
+With [hypnotoad](https://metacpan.org/pod/hypnotoad) there are several worker processes.  Share the cache
+between them, and give them a lock directory, so only one worker builds a
+missing page:
+
+```perl
+plugin 'Buffer' => {
+    cache          => CHI->new(driver => 'File', root_dir => '/var/cache/myapp'),
+    cache_lock_dir => '/var/lib/myapp/buffer-locks',
+};
+```
+
+For workers on several machines, see ["Multiple hosts"](#multiple-hosts).
+
+### 5. One Response Is Different
+
+Put a `buffer` value in the stash.  `0` leaves the response alone; a hash
+changes some options for this response only:
+
+```perl
+get '/download' => sub {
+    my $c = shift;
+    $c->stash(buffer => 0);    # already compressed: do not touch it
+    $c->render(data => $zip_file, format => 'zip');
+};
+
+get '/raw' => sub {
+    my $c = shift;
+    $c->stash(buffer => {optimise_content => 0});
+    $c->render(template => 'raw');
+};
+```
+
+### 6. A Whole Section Is Different
+
+Some options can be set once for a group of routes:
+
+```perl
+my $docs = app->routes->under('/docs')->to(optimise_content => 1);
+$docs->get('/intro' => sub { shift->render(template => 'docs/intro') });
+```
+
+### 7. Pages in Several Languages
+
+Add `Accept-Language` to the cache key, so each language is stored
+separately:
+
+```perl
+plugin 'Buffer' => {
+    cache   => $cache,
+    vary_by => ['cookie', 'accept-language'],
+};
+```
+
+### 8. Translate the "Busy" Message
+
+While one request builds a page, a request that waits too long gets
+`503 Service Unavailable` with a short text.  Change the text with
+`messages`:
+
+```perl
+plugin 'Buffer' => {
+    cache    => $cache,
+    messages => {retry_later => "Bitte versuchen Sie es gleich noch einmal.\n"},
+};
+```
+
+### 9. A Full Application
 
 ```perl
 package MyApp;
 use Mojo::Base 'Mojolicious';
+use CHI;
 
 sub startup {
     my $self = shift;
-    $self->plugin('Buffer', optimise_content => 1);
-    $self->routes->get('/' => sub {
-        my $c = shift;
-        $c->render(template => 'index');
+
+    $self->plugin('Buffer', {
+        optimise_content => 1,
+        cache            => CHI->new(driver => 'File', root_dir => '/var/cache/myapp'),
+        cache_lock_dir   => '/var/lib/myapp/buffer-locks',
+        cache_duration   => '10 minutes',
+        vary_by          => [],    # these pages are the same for everyone
     });
+
+    $self->routes->get('/')->to('pages#home');
 }
-```
 
-Compression is negotiated from the `Accept-Encoding` request header, so
-nothing extra is needed in your actions - a client that accepts gzip gets
-gzip, everyone else gets the uncompressed response.
-
-A server-side cache is optional and opt-in per action.  Give the plugin any
-object that understands `get()`, `set()` and `remove()`, such as [CHI](https://metacpan.org/pod/CHI),
-and call the helper before doing any work:
-
-```perl
-use CHI;
-plugin 'Buffer' => {cache => CHI->new(driver => 'File')};
-
-get '/expensive' => sub {
-    my $c = shift;
-    return if $c->buffer_is_cached;   # the cached response has been sent
-    # ... do the expensive work ...
-    $c->render(template => 'expensive');
-};
-```
-
-To turn the plugin off, or to override its options, for a single response,
-put a `buffer` value in the stash:
-
-```perl
-# Don't touch this response at all (e.g. it is already compressed,
-# or the user is downloading it)
-$c->stash(buffer => 0);
-
-# Use different options for this response
-$c->stash(buffer => {compress_content => 0, optimise_content => 0});
+1;
 ```
 
 ## Description
 
-`Mojolicious::Plugin::Buffer` is the Mojolicious equivalent of
-[CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).  It buffers the response that your
-application has produced, then, before it is sent:
+`Mojolicious::Plugin::Buffer` makes the pages of a [Mojolicious](https://metacpan.org/pod/Mojolicious)
+application smaller and faster to deliver, without changes to your actions.
+It is the Mojolicious version of [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).
 
-- optimises HTML by removing superfluous white space and comments,
-minifying embedded CSS and JavaScript, and replacing links back to your own
-site with relative links;
-- compresses the response with whichever of Brotli, Zstandard or gzip
-the client prefers and the server supports;
-- adds `ETag`, `Last-Modified` and `Vary` headers, and answers
-`If-None-Match` conditional requests, or `If-Modified-Since` when no
-`ETag` is generated, with `304 Not Modified`;
-- sets an accurate `Content-Length` after the above changes;
-- optionally stores the finished page in a server-side cache and
-replays it for later requests, so that an action can skip its expensive
-work entirely (see ["buffer\_is\_cached"](#buffer_is_cached)).
+### What It Does
 
-Unlike the CGI modules there is no source filter and no `END` block: a
-Mojolicious plugin can see the finished response through a hook, so the same
-effect is achieved without buffering `STDOUT` or guessing the environment.
-The plugin hooks `after_dispatch`, which is emitted once for every
-response, after the renderer has put the content into the response and
-before the transaction is resumed.  This means it also sees responses
-that were built with `$c->res->body` rather than `$c->render`.
+After your action has made a page, and before the page is sent, the plugin
+can:
+
+- **make HTML smaller** by removing extra white space and, with
+[HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker), comments and extra characters in embedded CSS and
+JavaScript.  It also shortens links to your own site;
+- **compress the page** with Brotli, Zstandard or gzip, whichever the
+browser accepts and the server has installed;
+- **add headers that let browsers reuse a copy they already have**
+(`ETag` and `Last-Modified`), and answer "you already have this" with a
+short `304 Not Modified` reply instead of the whole page;
+- **set the correct `Content-Length`** after all of these changes;
+- **keep finished pages in a server-side cache**, if you ask it to, so
+that a slow action does not have to run again for the next visitor (see
+["buffer\_is\_cached"](#buffer_is_cached)).
+
+### How It Works, in Plain Words
+
+- 1. When the application starts, ["register"](#register) checks your options and
+installs a _hook_: a small function that Mojolicious calls for every
+response, after the action has finished (`after_dispatch`).
+- 2. A request arrives and your action runs.  If the action calls
+["buffer\_is\_cached"](#buffer_is_cached) and a fresh copy of the page is in the cache, the copy
+is sent and the action stops early.
+- 3. Otherwise the action makes the page as usual.
+- 4. The hook looks at the finished response.  It leaves alone anything
+it should not touch: streamed responses, static files, empty bodies,
+statuses that have no body (1xx, 204, 206, 304), responses that are already
+compressed, and media types listed in ["excluded\_types"](#excluded_types).
+- 5. For an HTML page it removes white space, if ["optimise\_content"](#optimise_content)
+is on.
+- 6. It compresses the page for this browser, if the media type is in
+["compressible\_types"](#compressible_types).
+- 7. It stores the _uncompressed_ page in the cache, if the action
+called ["buffer\_is\_cached"](#buffer_is_cached) and the page may be stored.
+- 8. It adds the `ETag` and `Last-Modified` headers.  If the browser
+already has this version, it sends `304 Not Modified` with no body and
+stops.
+- 9. Otherwise it puts the compressed (or plain) page into the
+response, sets `Content-Length`, and the page is sent.
+
+Error pages such as `404` go through the same steps, but only `200`
+responses get an `ETag` or are stored in the cache.
+
+The plugin works through a hook, so it also sees responses built with
+`$c->res->body` rather than `$c->render`.  Unlike the CGI modules
+it needs no source filter and no `END` block.
+
+### Words Used in This Document
+
+- cache
+
+    A store that keeps finished pages for a while, for example [CHI](https://metacpan.org/pod/CHI).  The
+    plugin needs an object with `get`, `set` and `remove` methods.
+
+- cache key
+
+    The name under which a page is kept in the cache.  By default it is made
+    from the host, path, query string and the request headers listed in
+    ["vary\_by"](#vary_by).
+
+- ETag
+
+    A short fingerprint of the page, sent in a header.  A browser that has a
+    copy sends the fingerprint back; if it still matches, the server answers
+    `304`.
+
+- 304 Not Modified
+
+    A reply with no body that means "the copy you have is still correct".
+
+- content coding
+
+    The compression method of a response, such as `gzip` or `br` (Brotli).
+    The browser lists what it accepts in `Accept-Encoding`.
+
+- worker
+
+    One of several copies of the application that a server such as
+    [hypnotoad](https://metacpan.org/pod/hypnotoad) runs at the same time.  Workers do not share memory.
+
+- single-flight
+
+    When many requests ask for the same missing page at once, only one of them
+    builds it; the others wait and then get the result.
+
+- stash
+
+    Mojolicious's per-request hash of values, `$c->stash`.  The plugin
+    reads its per-response options from `$c->stash('buffer')`.
 
 ## Options
 
@@ -225,77 +374,82 @@ the digest for one response with `$c->stash(buffer => {generate_etag => 0})`, or
 
 ### Generate\_304
 
-Answer conditional requests with `304 Not Modified` when the
-`If-None-Match` header matches, defaults to 1.  `If-None-Match` takes
-precedence over `If-Modified-Since`, as required by RFC 7232.
+Answer "you already have this page" with `304 Not Modified`, defaults to
+1\.  A browser that has a copy of a page asks the server whether its copy is
+still correct.  It can ask in two ways:
 
-`If-Modified-Since` is only used when no `ETag` is generated for the
-response, which means ["generate\_etag"](#generate_etag) is off, unless ["trust\_last\_modified"](#trust_last_modified)
-opts back in.  `Last-Modified` is derived from the application and its
-templates, and says nothing about the data a page was rendered from: a
-database row or a stash value can change while the template stays untouched.
-A 304 on the timestamp alone would tell such a client that its stale copy is
-current, so with an `ETag` available only the tag can revalidate the
-response.  Clients that have the tag, which includes browsers after the first
-`200`, send `If-None-Match` and are unaffected.
+- `If-None-Match`: "my copy has this `ETag`".  This is exact,
+because the `ETag` is a fingerprint of the page itself.
+- `If-Modified-Since`: "my copy is from this date".  This is only a
+guess, because the date (see ["last\_modified"](#last_modified)) describes your _code and
+templates_, not the data shown on the page.
+
+The plugin uses them like this:
+
+- 1. If the request has `If-None-Match`, only the `ETag` decides.  The
+date is ignored, as RFC 7232 requires.
+- 2. If the page has an `ETag` (["generate\_etag"](#generate_etag) is on, the default),
+`If-Modified-Since` alone is _not_ trusted.  A database row can change
+while the template stays the same, and a `304` would then keep showing the
+browser old data.  Browsers send `If-None-Match` once they have seen an
+`ETag`, so they are not affected.
+- 3. If the page has no `ETag`, or ["trust\_last\_modified"](#trust_last_modified) is on, the
+date is used.
 
 It is not declarable for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)): it decides whether a client is
-told its copy is current, so a section that could also turn the answer off
+["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)).  It decides whether a browser is
+told that its copy is correct, and a section that could also turn it off
 would contradict ["trust\_last\_modified"](#trust_last_modified).  Use
 `$c->stash(buffer => {generate_304 => 0})` where one endpoint must always
 send a body.
 
 ### Last\_Modified
 
-Add a `Last-Modified` header, and honour `If-Modified-Since` when no
-`ETag` is generated (see ["generate\_304"](#generate_304)) or ["trust\_last\_modified"](#trust_last_modified) is
-set, defaults to 1, which uses the newest modification time of the
-application script (`$0`) and the renderer's template files and directories.
-May be:
+Add a `Last-Modified` header, defaults to 1.  The header says when the page
+last changed.  The value may be:
 
-- 0 - do not generate the header
-- 1 - use the newest modification time of the application script
-(`$0`) and the files and directories under the renderer's template paths
-- a number - a Unix epoch
-- a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can parse
-- a coderef - called with the controller, returns 0, 1, an epoch or a
-date string (a coderef returning another coderef is treated as 0)
+- 0 - do not add the header
+- 1 - the newest modification time of the application script (`$0`)
+and of every file and directory under the renderer's template paths
+- a number - a Unix epoch (seconds since 1970)
+- a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can read, such as
+`'Sun, 06 Nov 1994 08:49:37 GMT'`
+- a code reference - called with the controller; it returns one of the
+values above (a code reference that returns another code reference counts
+as 0)
 
-The value is ignored for responses that are not `200` responses to
-`GET` or `HEAD` requests.  If `If-None-Match` is present it takes
-precedence over `If-Modified-Since`, as required by RFC 7232.  A
-`Last-Modified` header set by the action is kept.
+Some rules:
 
-The default is the newest mtime of the application file and the files and
-directories under the renderer's `paths`, so editing a template changes
-`Last-Modified` and discards cache entries built from the old one.  `morbo`
-and `hypnotoad` set `$0` to your application script, but under a PSGI or
-module-only deployment it may be the wrapper instead; pass an explicit epoch
-or a coderef there.  The template paths are scanned once per request, unless
-["template\_mtime\_cache"](#template_mtime_cache) is configured, so for a large tree or an application
-that does not use templates, an explicit epoch or coderef is cheaper.
-Database rows and other inputs are not covered; use a coderef for pages whose
-freshness depends on them, or set `last_modified => 0` and rely on
-["generate\_etag"](#generate_etag) alone.  A page whose data changes without its template
-changing is never answered with a 304 from this timestamp while an `ETag` is
-generated, but the header itself still only describes the code, so a client
-that keeps `If-Modified-Since` without the tag will keep refetching it.
+- The header is only added to `200` responses to `GET` and `HEAD`.
+A `Last-Modified` header that the action set itself is kept.
+- With the default (1), editing a template changes the date.
+(Separately, and whatever this option says, the server-side cache throws
+away entries built before the newest change to the script or a template;
+see ["buffer\_is\_cached"](#buffer_is_cached).)
+- The date describes the _code_, not your data.  A change in the
+database does not move it.  For pages built from data, use a code reference
+that returns the data's own date, or set `last_modified => 0` and rely
+on the `ETag` (see ["generate\_304"](#generate_304) for why that is safe).
+- The default looks at every template file on every request, unless
+["template\_mtime\_cache"](#template_mtime_cache) is set.  For a large template tree, or an
+application without templates, an epoch or a code reference is cheaper.
+A server-side cache lookup also looks at the template files, whatever this
+option says; see ["Last-Modified performance"](#last-modified-performance).
+- `morbo` and `hypnotoad` set `$0` to your application script.
+Under PSGI or another wrapper, `$0` may be the wrapper instead; pass an
+epoch or a code reference there.
 
 ### Trust\_Last\_Modified
 
-Answer `If-Modified-Since` even when an `ETag` is generated, defaults to 0.
-Only enable it for pages whose body is a function of the application and its
-templates, with no database rows, session values or other inputs that can
-change under an untouched template.
+Also answer `If-Modified-Since` when the page has an `ETag`, defaults to 0.
 
-["last\_modified"](#last_modified) describes the code, not the body, which is why
-`If-Modified-Since` is otherwise ignored while a tag exists.  Turning this
-on restores timestamp revalidation for clients that send only
-`If-Modified-Since`, so a page rendered from its templates alone can be
-revalidated by those clients without a tag.  `If-None-Match` still takes
-precedence, so a client holding the tag is still protected from a stale copy
-even here:
+By default the plugin does not trust the date when it has a fingerprint
+(see ["generate\_304"](#generate_304)).  Turn this on only for pages that are built from the
+application and its templates _and nothing else_: no database, no session,
+no other input that can change while the templates stay the same.  Then the
+date is accurate, and clients that only send `If-Modified-Since` can get a
+`304` too.  `If-None-Match` still comes first, so a browser that sends the
+`ETag` is always answered correctly.
 
 ```perl
 plugin 'Buffer' => {
@@ -303,14 +457,12 @@ plugin 'Buffer' => {
 };
 ```
 
-Use it per response instead with `$c->stash(buffer => {trust_last_modified
-&#x3d;> 1})` when only some pages are that predictable.
-
-It can be declared for a group of pages (see
-["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a section that renders
-templates and nothing else.  The declaration has no effect when
-["generate\_304"](#generate_304) is off, and it cannot make a page safe: it only says that the
-application and its templates really are the only inputs.
+Use it for one response with
+`$c->stash(buffer => {trust_last_modified => 1})`, or declare it for a
+group of pages (see ["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a
+section that renders templates and nothing else.  It has no effect when
+["generate\_304"](#generate_304) is off.  It cannot make a page safe; it only tells the
+plugin that the templates really are the only input.
 
 ### Last-Modified Performance
 
@@ -327,9 +479,11 @@ filesystem will move them.  Run `benchmarks/last_modified.pl` with your own
 tree size to measure all three variants.
 
 Use an explicit epoch or a coderef when template changes do not need to move
-`Last-Modified` and you do not rely on response-cache invalidation after a
-template edit.  Use ["template\_mtime\_cache"](#template_mtime_cache) when you need template awareness
-but not a scan on every request: it costs one cache lookup per request and
+`Last-Modified`.  This removes the scan from ordinary responses, but not
+from server-side cache lookups: ["buffer\_is\_cached"](#buffer_is_cached) still scans, so that an
+entry built from an old template is thrown away.  Use
+["template\_mtime\_cache"](#template_mtime_cache) when you need template awareness but not a scan on
+every request: it costs one cache lookup per request, covers both uses, and
 bounds how long a template edit can be missed by its duration.
 
 ### Template\_Mtime\_Cache
@@ -687,41 +841,6 @@ lock_dir_not_writable           cache_lock_dir 'DIR' is not a writable directory
 A failure to validate `$app` itself is reported by [Params::Validate::Strict](https://metacpan.org/pod/Params%3A%3AValidate%3A%3AStrict)
 and is not translated.
 
-#### Formal Specification
-
-```
-[OPTION, VALUE, APP]
-
-Known == dom Schema
-Valid == { o : Known; v : VALUE | v ∈ Schema(o) }
-
-┌─ Plugin ────────────────────────────────────
-│ options : OPTION ⇸ VALUE
-│ inflight : KEY ⇸ Flight
-│ lock : LockBackend ∪ {⊥}
-├─────────────────────────────────────────────
-│ dom options = Known
-│ ∀ o : dom options • (o, options o) ∈ Valid
-└─────────────────────────────────────────────
-
-┌─ Register ──────────────────────────────────
-│ ΔPlugin
-│ app? : APP ; conf? : OPTION ⇸ VALUE ; result! : Plugin
-├─────────────────────────────────────────────
-│ dom conf? ⊆ Known
-│ ∀ o : dom conf? • (o, conf? o) ∈ Valid
-│ ¬(cache_lock ∈ dom conf? ∧ cache_lock_dir ∈ dom conf?)
-│ ran (conf? encodings) ⊆ {br, zstd, gzip, x-gzip}
-│ options′ = Defaults ⊕ conf?
-│ inflight′ = ∅
-│ compress(renderer app?)′ = false
-│ after_dispatch ∈ hooks(app?)′ ∧ buffer_is_cached ∈ helpers(app?)′
-│ result! = θPlugin′
-└─────────────────────────────────────────────
-
--- Any violated predicate: croak, app? is unchanged
-```
-
 #### Pseudocode
 
 ```
@@ -866,26 +985,6 @@ log_gave_up             debug  The wait timed out; a 503 was sent
 log_finish_waiter_failed error Replaying to a waiting request failed
 ```
 
-#### Formal Specification
-
-```
-┌─ BufferIsCached ────────────────────────────
-│ ΔPlugin ; ΔResponse
-│ c? : Controller ; result! : 𝔹
-├─────────────────────────────────────────────
-│ let k == key(c?) •
-│   cacheable(c?) ∧ k ∈ dom cache ∧ fresh(cache k) ⇒
-│       response′ = replay(cache k) ∧ result! = true
-│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ dom inflight ∧ singleFlight ⇒
-│       waiters′(k) = waiters(k) ∪ {c?} ∧ result! = true
-│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∈ held(lock) ∧ singleFlight ⇒
-│       polling′ = polling ∪ {(c?, k)} ∧ result! = true
-│   cacheable(c?) ∧ k ∉ dom cache ∧ k ∉ dom inflight ⇒
-│       (singleFlight ⇒ k ∈ dom inflight′) ∧ result! = false
-│   ¬cacheable(c?) ⇒ result! = false
-└─────────────────────────────────────────────
-```
-
 #### Pseudocode
 
 ```perl
@@ -959,11 +1058,6 @@ say $plugin->i18n('log_cache_hit', {key => 'buffer:abc'});   # HIT buffer:abc
 #### Messages
 
 See ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n).
-
-#### Formal Specification
-
-See ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n); here `overrides` is the
-["messages"](#messages) option.
 
 ## Deployment
 
@@ -1175,6 +1269,162 @@ generation feature rather than a response filter and is not part of this
 plugin.  The server-side cache is available as the opt-in
 ["buffer\_is\_cached"](#buffer_is_cached) helper described above.
 
+## Common Pitfalls
+
+### The `Buffer` Stash: What Each Value Means
+
+- `buffer => 0` and `buffer => ''` turn the plugin
+**off** for this response.
+- `buffer => undef` does **not** turn it off.  undef means
+"nothing set here", so the plugin options are used.
+- `buffer => {}` keeps the plugin **on** and changes nothing.
+
+### The `Buffer` Stash Is Merged One Level Deep Only
+
+The hash you put in the stash is laid over the plugin options one key at a
+time.  A key you give replaces the whole plugin value for that key; nothing
+inside it is merged.  So lists are replaced, not added to:
+
+```perl
+plugin 'Buffer' => {encodings => [qw(br gzip)]};
+
+# This response may ONLY use br.  If Brotli is not installed, it is
+# not compressed at all, and an error is logged.
+$c->stash(buffer => {encodings => ['br']});
+```
+
+Values in the stash are not checked the way `plugin()` options are, and
+they are not filtered by which compression modules are installed.
+
+### Undef in Options
+
+- In the `buffer` stash, an undef value is a real value.
+`{compress_content => undef}` turns compression **off** for that
+response, and `{cache => undef}` turns the cache off.
+- In a group declaration (a route default or `buffer_NAME`
+controller method), undef means "not declared", so the plugin option is
+used.
+- In `plugin()` options, undef is accepted only where it means "use
+the default" or "off":
+
+    ```
+    optimise_content and the true/false   off
+      flags (compress_content,
+      rewrite_links, generate_etag,
+      generate_304, trust_last_modified,
+      cache_single_flight)
+    last_modified                         no Last-Modified header
+    cache, cache_lock, cache_lock_dir,    not used
+      template_mtime_cache
+    cache_key                             the generated key
+    cache_duration, cache_lock_timeout,   their default values
+      template_mtime_cache_duration
+    messages                              the built-in English texts
+    ```
+
+    For `encodings`, `compressible_types`, `excluded_types`, `vary_by` and
+    `min_compress_size`, undef is refused when the plugin is registered.  This
+    matters most for `vary_by`: an undef there would have silently removed the
+    `Cookie` header from the cache key.
+
+- In `messages`, undef does **not** restore the built-in text.
+`messages => {retry_later => undef}` makes visitors see the
+word `retry_later`.  Leave the key out instead.  See
+["COMMON PITFALLS" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#COMMON-PITFALLS).
+
+### Using the Server-Side Cache Safely
+
+- **Check access before ["buffer\_is\_cached"](#buffer_is_cached).**  A cached page is sent
+straight away and the rest of the action does not run.  Any login or
+country check that comes later in the action is skipped on a hit.
+- **Personal pages need a personal key.**  `vary_by => []`
+makes the key the same for every visitor.  A page that shows a name, a
+basket or anything else from the session is then shown to other visitors.
+Keep the default `['cookie']`, or set ["cache\_key"](#cache_key).
+- **The cache must be shared by all workers.**  With several workers,
+a per-worker cache such as CHI's `Memory` driver means a waiting request
+never sees the entry another worker built; after ["cache\_lock\_timeout"](#cache_lock_timeout)
+it gets `503 Service Unavailable`.
+- **Waiting requests get 503, not a second build.**  If the request
+that is building a page fails, makes something that cannot be stored (for
+example, it sets a cookie), or is slower than ["cache\_lock\_timeout"](#cache_lock_timeout), the
+requests waiting for it get `503` with `Retry-After: 1`.
+- **A Redis lock TTL must be longer than the slowest action**, or a
+second worker starts building the same page.
+- **Template edits can be missed for a while** when
+["template\_mtime\_cache"](#template_mtime_cache) is set: until its entry expires.
+
+### Other Pitfalls
+
+- **Do not turn the renderer's compression back on.**  The plugin turns
+off `$app->renderer->compress`.  If you turn it on again, the renderer
+compresses first, and the plugin then skips those responses: no
+optimisation and no `ETag`.
+- **Do not stream through the plugin.**  Responses written with
+`$c->write` are not buffered and are left alone.
+- **`$c->stash(buffer => ...)` must be set before the action
+ends.**  The plugin reads it in `after_dispatch`.  To turn the cache off for
+one request, set `{cache => undef}` _before_ calling
+["buffer\_is\_cached"](#buffer_is_cached).
+
+## Encoding
+
+This section says which text may contain non-ASCII characters, such as
+accented letters, other scripts and emoji.
+
+- Response bodies
+
+    Any encoding works.  Pages rendered by Mojolicious are already UTF-8 bytes
+    when the plugin sees them.  A body that is still a Perl character string is
+    encoded to UTF-8 first.  Bodies in another character set, such as
+    ISO-8859-1 or Shift\_JIS, are passed through unchanged; the plugin does not
+    convert them.
+
+- HTML optimisation
+
+    Safe for every UTF-8 character, including emoji.  The optimiser only
+    changes ASCII white space (space, tab, carriage return, line feed, form
+    feed) and ASCII markup.  A non-breaking space (U+00A0) is kept.
+
+- The `ETag`
+
+    Made from the bytes of the body, so any content is fine.
+
+- Cache keys
+
+    A custom ["cache\_key"](#cache_key) may contain any characters, including emoji.  Keys
+    are encoded to UTF-8 before they are hashed for the lock backends.  The
+    generated key is an ASCII MD5 digest.  The cache itself receives a custom
+    key as it is; [CHI](https://metacpan.org/pod/CHI)'s File and Memory drivers accept any characters, but
+    check this for other cache objects.
+
+- Request headers in ["vary\_by"](#vary_by)
+
+    Header _names_ are ASCII.  Header _values_ are used as raw bytes, so any
+    value is fine.
+
+- The `503` text (`retry_later`) and other messages
+
+    May contain any characters.  The `503` body is sent as UTF-8 with
+    `Content-Type: text/plain; charset=UTF-8`.  Log lines go through
+    [Mojo::Log](https://metacpan.org/pod/Mojo%3A%3ALog), which writes them as UTF-8.
+
+- Error messages
+
+    The plugin's `croak` messages are Perl character strings.  If you
+    translate them into a non-ASCII language and print them to `STDERR`, give
+    `STDERR` an encoding layer, or Perl warns "Wide character".
+
+- File paths (`cache_lock_dir`)
+
+    Paths go to the operating system as bytes.  ASCII paths are always safe.
+    For a non-ASCII path, pass bytes that are already encoded the way your file
+    system expects, usually UTF-8.
+
+- Option names, encoding names and media types
+
+    These are ASCII words.
+
 ## Limitations
 
 - Only in-memory responses are processed.  Static files
@@ -1248,6 +1498,321 @@ is not negotiated from `Accept-Language`.
 ## Author
 
 Nigel Horne, `<njh at bandsman.co.uk>`
+
+## Formal Specification
+
+This section describes the plugin in the Z notation, for readers who want
+an exact model.  You do not need it to use the plugin.  `now` is the
+current time and `mtime` is the newest modification time of the
+application script and its templates.  `Schema` maps each option name to
+its [Params::Validate::Strict](https://metacpan.org/pod/Params%3A%3AValidate%3A%3AStrict) rule.
+
+```
+[OPTION, VALUE, APP, KEY, Controller, Entry, Guard, Response]
+
+Known == dom Schema
+Valid == { o : Known; v : VALUE | v ∈ Schema(o) }
+
+Flight == [ waiters : ℙ Controller ; deadline : ℝ ; guard : Guard ∪ {⊥} ]
+
+┌─ Plugin ────────────────────────────────────
+│ options : OPTION ⇸ VALUE
+│ inflight : KEY ⇸ Flight
+│ polling : Controller ⇸ (KEY × ℝ)
+│ lock : LockBackend ∪ {⊥}
+├─────────────────────────────────────────────
+│ dom options = Known
+│ ∀ o : dom options • (o, options o) ∈ Valid
+│ ∀ k : dom inflight • (inflight k).deadline ≤ now + timeout
+└─────────────────────────────────────────────
+
+┌─ Cache ─────────────────────────────────────
+│ store : KEY ⇸ Entry
+│ created : KEY ⇸ ℝ
+├─────────────────────────────────────────────
+│ dom created = dom store
+└─────────────────────────────────────────────
+
+fresh : ℙ KEY
+fresh = { k : dom store | created k ≥ mtime }
+```
+
+### Register
+
+```
+┌─ Register ──────────────────────────────────
+│ ΔPlugin
+│ app? : APP ; conf? : OPTION ⇸ VALUE ; result! : Plugin
+├─────────────────────────────────────────────
+│ dom conf? ⊆ Known
+│ ∀ o : dom conf? • (o, conf? o) ∈ Valid
+│ ∀ o : dom conf? • conf? o = ⊥ ⇒ undefAllowed(o)
+│ ¬(cache_lock ∈ dom conf? ∧ cache_lock_dir ∈ dom conf?)
+│ ran (conf? encodings) ⊆ {br, zstd, gzip, x-gzip}
+│ options′ = Defaults ⊕ conf?
+│ inflight′ = ∅ ∧ polling′ = ∅
+│ compress(renderer app?)′ = false
+│ after_dispatch ∈ hooks(app?)′ ∧ buffer_is_cached ∈ helpers(app?)′
+│ result! = θPlugin′
+└─────────────────────────────────────────────
+-- Any violated predicate: croak, and app? is unchanged
+```
+
+### Buffer\_Is\_Cached
+
+`cacheable(c)` holds when the plugin is on for this response, a cache is
+configured, the method is `GET` or `HEAD`, and the request carries no
+`Authorization` header, no `no-store`, `no-cache`, `private` or
+`max-age=0` directive, and `NO_CACHE` and `NO_STORE` are not set.
+`busy(k)` holds when the lock backend says another process holds `k`.
+
+```
+┌─ BufferIsCached ────────────────────────────
+│ ΔPlugin ; ΔCache
+│ c? : Controller ; result! : 𝔹 ; response! : Response
+├─────────────────────────────────────────────
+│ let k == key(c?) •
+│   ¬cacheable(c?) ⇒ result! = false
+│   cacheable(c?) ∧ k ∈ fresh ⇒
+│       response! = replay(store k) ∧ result! = true
+│   cacheable(c?) ∧ k ∉ fresh ⇒ store′ = {k} ⩤ store ∧ (
+│     ¬singleFlight ⇒ result! = false
+│     singleFlight ∧ k ∈ dom inflight ⇒
+│       (inflight′ k).waiters = (inflight k).waiters ∪ {c?}
+│       ∧ result! = true
+│     singleFlight ∧ k ∉ dom inflight ∧ busy(k) ⇒
+│       polling′ = polling ⊕ {c? ↦ (k, now + timeout)}
+│       ∧ result! = true
+│     singleFlight ∧ k ∉ dom inflight ∧ ¬busy(k) ⇒
+│       k ∈ dom inflight′ ∧ (inflight′ k).waiters = ∅
+│       ∧ result! = false )
+└─────────────────────────────────────────────
+```
+
+The building request finishes (the `after_dispatch` hook), or its time
+runs out.  `e?` is the stored entry, or `⊥` when the response could not be
+stored or the build timed out.
+
+```
+┌─ FinishFlight ──────────────────────────────
+│ ΔPlugin
+│ k? : KEY ; e? : Entry ∪ {⊥}
+├─────────────────────────────────────────────
+│ k? ∈ dom inflight
+│ ∀ w : (inflight k?).waiters •
+│     (e? ≠ ⊥ ⇒ response(w)′ = replay(e?))
+│   ∧ (e? = ⊥ ⇒ response(w)′ = 503)
+│ inflight′ = {k?} ⩤ inflight
+│ (inflight k?).guard ≠ ⊥ ⇒ released((inflight k?).guard)
+└─────────────────────────────────────────────
+
+ExpireFlight == [ FinishFlight | now ≥ (inflight k?).deadline ∧ e? = ⊥ ]
+```
+
+Every 0.1 seconds, each request waiting for another worker looks again:
+
+```
+┌─ PollTick ──────────────────────────────────
+│ ΔPlugin
+│ c? : dom polling
+├─────────────────────────────────────────────
+│ let (k, d) == polling c? •
+│   k ∈ fresh ⇒ response(c?)′ = replay(store k)
+│                ∧ polling′ = {c?} ⩤ polling
+│   k ∉ fresh ∧ now ≥ d ⇒ response(c?)′ = 503
+│                ∧ polling′ = {c?} ⩤ polling
+│   k ∉ fresh ∧ now < d ∧ busy(k) ⇒ polling′ = polling
+│   k ∉ fresh ∧ now < d ∧ ¬busy(k) ⇒
+│       response(c?)′ = 503 ∧ polling′ = {c?} ⩤ polling
+└─────────────────────────────────────────────
+-- In the last case the lock is taken and the cache read once more
+-- before the 503, so an entry stored at that moment is still replayed
+```
+
+### i18n
+
+The same operation as ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n), where
+`overrides` is the ["messages"](#messages) option.
+
+## State Diagram
+
+There are three pictures.  The numbers on the arrows are explained below
+each picture.  In each explanation, the text in `[ ]` is the condition and
+the text after `/` is what happens.
+
+### A. One Page in the Server-Side Cache
+
+This is the life of one cache key, seen by all workers together.
+
+```perl
+             +---------------------+
+             |        EMPTY        |<-----------------------+
+             |  nothing is stored  |                        |
+             +---------------------+                        |
+               |        ^       ^                           |
+            (1)|     (3)|    (4)|                           |
+               v        |       |                           |
+             +---------------------+      (5)               |
+             |      BUILDING       |-----------+            |
+             | one request builds; |           |            |
+             | others wait         |           v            |
+             +---------------------+    +--------------+    |
+               |                        |    CACHED    |    |
+            (2)+----------------------->| fresh entry  |    |
+                                        +--------------+    |
+                                          |    ^      |     |
+                                       (6)|    |(7)   |(8)  |
+                                          v    |      v     |
+                                        +--------------+    |
+                                        |    STALE     |----+
+                                        |  too old     | (9)
+                                        +--------------+
+
+(1) a request calls buffer_is_cached  [no fresh entry, single-flight
+    on, nobody else building]
+    / X-Cache: MISS; this request becomes the builder; it takes the
+      shared lock if one is configured; a timer of
+      cache_lock_timeout starts
+(2) the builder's response is finished  [200, may be stored]
+    / the uncompressed page is stored with cache_duration; every
+      waiting request is answered from it; the lock is released
+(3) the builder's response is finished  [error, or not storable:
+    it sets a cookie, is marked private or no-store, or varies on a
+    header not in vary_by]
+    / every waiting request gets 503 with Retry-After: 1; the lock
+      is released
+(4) cache_lock_timeout passes before the builder finishes
+    / waiting requests get 503; the lock is released.  If the
+      builder finishes later and its page may be stored, it is still
+      stored: that is arrow (5).
+(5) a late builder finishes  [200, may be stored]
+    / the page is stored
+(6) the application script or a template file is changed
+    / nothing happens yet; the entry is now older than the code
+(7) a request reads the entry  [it is fresh]
+    / the stored page is replayed with X-Cache: HIT; it is
+      compressed for this client and gets its own ETag
+(8) cache_duration passes
+    / the cache forgets the entry
+(9) a request reads the entry  [it is older than the code]
+    / the entry is removed; the request goes on as at (1)
+
+While BUILDING, a second request for the same key:
+  - in the same worker: waits for (2), (3) or (4);
+  - in another worker, with a shared lock: looks in the cache every
+    0.1 seconds until the page appears, the lock is free, or
+    cache_lock_timeout passes;
+  - with cache_single_flight => 0: does not wait, and builds the page
+    too.
+```
+
+### B. One Request That Calls Buffer\_Is\_Cached
+
+```
+                     buffer_is_cached
+                            |
+                            v
+ +--------------+  (1)  +--------+  (5)  +-----------------+
+ |  RUN ACTION  |<------| DECIDE |------>|     BUILDER     |
+ |  not cached  |       +--------+       | the action runs;|
+ +--------------+        |   |   |       | see picture C   |
+                      (2)|   |   |(3)    +-----------------+
+                         v   |   v
+                  REPLAYED   |  +----------------+  (8)
+                             |  | WAITING_REMOTE |------> REPLAYED
+                             |  | polls the cache|  (9)
+                             |  | 10 times a sec |------> 503
+                             |  +----------------+
+                             |     |        ^
+                          (4)|     +--(10)--+
+                             v
+                    +----------------+  (6)
+                    | WAITING_LOCAL  |------> REPLAYED
+                    | same worker    |  (7)
+                    +----------------+------> 503
+
+(1) [the plugin is off, no cache, method not GET or HEAD, an
+    Authorization header, Cache-Control no-store, no-cache, private
+    or max-age=0, NO_CACHE or NO_STORE set, or the cache's get() died]
+    / returns false: the action runs normally
+(2) [a fresh entry exists]
+    / status, headers and body are replayed; X-Cache: HIT; the
+      response is finished; returns true
+(3) [no entry; another worker holds the shared lock]
+    / render_later; X-Cache: MISS; returns true
+(4) [no entry; a request in this worker is building it]
+    / render_later; X-Cache: MISS; returns true
+(5) [no entry; nobody is building it, or single-flight is off]
+    / X-Cache: MISS; returns false.  If the lock backend failed, the
+      error is logged and this worker builds without a shared lock.
+(6) the builder in this worker stored the page
+    / the page is replayed with X-Cache: HIT
+(7) the builder failed, made something not storable, or
+    cache_lock_timeout passed
+    / 503 with Retry-After: 1 and the retry_later text
+(8) a poll finds the page in the cache
+    / the page is replayed
+(9) a poll finds [cache_lock_timeout has passed], or [the lock is free
+    but there is still no page], or [the lock backend failed]
+    / 503 with Retry-After: 1
+(10) a poll finds [no page yet, and the lock is still held]
+    / wait another 0.1 seconds
+
+Calling buffer_is_cached again in the same request returns the same
+answer and changes nothing.
+```
+
+### C. What the After\_Dispatch Hook Does With Every Response
+
+```perl
+ response finished by the action
+      |
+      v
+ +-----------------+  (1)
+ | 1. CHECK        |-----------------------------------> sent as it is
+ +-----------------+
+      |
+      v
+ +-----------------+  [HTML and optimise_content on, and the result
+ | 2. OPTIMISE     |   is smaller]  / white space removed, links
+ +-----------------+   shortened.  Skipped for a replayed entry.
+      |
+      v
+ +-----------------+  [compress_content on and type in
+ | 3. COMPRESS     |   compressible_types] / Vary: Accept-Encoding;
+ +-----------------+   then [client accepts a coding, body >=
+      |                min_compress_size, result smaller]
+      |                / body compressed, Content-Encoding set
+      |
+      v
+ +-----------------+  [buffer_is_cached ran, it was not a hit, the
+ | 4. STORE        |   status is 200, the response may be stored]
+ +-----------------+   / the uncompressed page goes into the cache
+      |
+      v
+ +-----------------+  (2)
+ | 5. VALIDATE     |-----------------------------------> 304, no body
+ +-----------------+
+      |
+      v
+ +-----------------+
+ | 6. SEND         |  the compressed or plain body; Content-Length
+ +-----------------+
+      |
+      v
+ if this request was the builder: answer every waiting request and
+ release the shared lock (arrows (2) and (3) of picture A).  This
+ also happens when a step above dies.
+
+(1) [the stash says buffer => 0, or the body is empty, streamed or a
+    file, or the status is 1xx, 204, 206 or 304, or a
+    Content-Encoding is already set, or the media type is unknown or
+    in excluded_types]
+(2) [GET or HEAD, status 200, generate_304 on, and If-None-Match
+    matches the ETag; or there is no ETag (or trust_last_modified is
+    on) and If-Modified-Since is not older than Last-Modified]
+    / 304 Not Modified is sent with no body
+```
 
 ## License and Copyright
 

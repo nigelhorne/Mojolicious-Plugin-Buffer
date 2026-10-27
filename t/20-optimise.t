@@ -2,6 +2,7 @@ use strict;
 use warnings;
 
 use Test::More;
+use Encode ();
 use Mojolicious;
 use Test::Mojo;
 
@@ -319,6 +320,30 @@ subtest 'a body that already contains the placeholder marker is restored exactly
 
 	like($body, qr/\x00MPB0\x00MPB/, 'the text that looks like a marker is kept');
 	like($body, qr/<pre>  keep  <\/pre>/, 'the protected element is restored');
+};
+
+# UTF-8 continuation bytes \xA0 and \x85 look like white space to a
+# Unicode-aware \s.  "a grave" is C3 A0 and "A ring" is C3 85, so squashing
+# once cut such characters in half next to a tag.
+subtest 'optimising keeps multi-byte UTF-8 characters whole' => sub {
+	my $text = "<div>voil\x{e0}</div>\n<p>\x{c5}\n<b>ngstr\x{f6}m</b> \x{1F600}</p>\n<div>\x{420}\x{a0}</div>";
+
+	my $utf8 = Mojolicious->new;
+	$utf8->log->level('fatal');
+	$utf8->plugin('Buffer', optimise_content => 1);
+	$utf8->routes->get('/' => sub { shift->render(text => $text) });
+
+	my $ut = Test::Mojo->new($utf8);
+	$ut->ua->transactor->compressed(0);
+	$ut->get_ok('/')->status_is(200);
+
+	my $bytes = $ut->tx->res->body;
+	my $decoded = eval { Encode::decode('UTF-8', $bytes, Encode::FB_CROAK | Encode::LEAVE_SRC) };
+	ok(defined($decoded), 'the body is still valid UTF-8') or diag(unpack('H*', $bytes));
+	like($decoded // '', qr/voil\x{e0}<\/div>/, 'a character before a tag survives');
+	like($decoded // '', qr/\x{c5}/, 'a character before a line break survives');
+	like($decoded // '', qr/\x{1F600}/, 'an emoji survives');
+	like($decoded // '', qr/\x{420}\x{a0}<\/div>/, 'a no-break space is kept: it is content, not markup');
 };
 
 subtest 'optimise_content rejects unknown levels' => sub {
