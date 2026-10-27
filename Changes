@@ -1,6 +1,6 @@
 Revision history for Mojolicious-Plugin-Buffer
 
-0.001.0
+0.001.0	Mon Oct 26 08:30:30 PM EDT 2026
 	Initial version.
 	Fix optimise_content deleting a "+" at the start of a line, which
 	corrupted text such as phone numbers and changed the meaning of
@@ -59,7 +59,7 @@ Revision history for Mojolicious-Plugin-Buffer
 	attempts and the never-spread message, without waiting on the scheduler,
 	and run the same drill against a real single-worker hypnotoad when
 	MPB_LIVE_RETRY is set.
-	Add a runnable hypnotoad example under eg/hypnotoad, and a smoke test
+	Add a runnable hypnotoad example under examples/hypnotoad, and a smoke test
 	that starts it on an ephemeral port and checks a MISS followed by a HIT.
 	Add an optional live Redis integration test, skipped unless
 	MPB_REDIS_URL or REDIS_SERVER is configured, with Redis::Fast accepted as
@@ -90,7 +90,7 @@ Revision history for Mojolicious-Plugin-Buffer
 	generate_etag and generate_304 per-endpoint, and say why.
 	Document the group declaration once in the options list, with a table of
 	which options support it, instead of repeating the rules per option.
-	Add a runnable grouped-sections example under eg/grouped-sections, with
+	Add a runnable grouped-sections example under examples/grouped-sections, with
 	one section declared on an under route and one in a controller, and a
 	test that runs it and asserts both declarations.
 	Stop optimise_content cutting UTF-8 characters in half: under Mojo::Base
@@ -110,3 +110,31 @@ Revision history for Mojolicious-Plugin-Buffer
 	specifications gathered into FORMAL SPECIFICATION, and ASCII STATE
 	DIAGRAMs for every module.  Correct the Last-Modified performance advice:
 	an explicit epoch does not stop the template scan made by cache lookups.
+	Require Perl 5.26, the minimum of Params::Validate::Strict; 5.16 was
+	declared but could never install the dependencies.
+	Keep PAUSE from indexing the example applications (MyApp,
+	GroupedSections), declare the licence as GPL 2 in META, recommend
+	Redis or Redis::Fast for Lock::Redis, and declare every test module.
+	Add MANIFEST.SKIP, and tests for POD syntax, POD coverage and
+	extract-schemas --strict-pod=fatal, which skip when their tools are
+	not installed.
+	The suite passes on Perl 5.26 with Mojolicious 9.0 and the other
+	declared minimum versions, and a new CI job checks that it still does.
+	Give every module the same version->declare version, and check in
+	t/00-load.t that all four modules load and agree, without hard-coding
+	the version.
+	Test that 404 and 500 responses are neither stored in the cache nor
+	given an ETag, and document the order in which option errors are
+	reported.
+	Fix the template mtime scan on Windows before Perl 5.38, where stat()
+	reports inode 0 for everything: every directory after the first
+	looked already scanned, so a newer template in a subdirectory or
+	behind a symlink never moved Last-Modified or invalidated the cache.
+	Directories without an inode are now told apart by path, and the scan
+	stops 32 directories down, which also ends a symlink loop.
+	Squash the indentation after CRLF line breaks, as Windows checkouts
+	have, the same as after LF.
+	Expect ENOENT rather than ENOTDIR on Windows in t/locales.t when a
+	lock directory is created below a plain file.
+	Leave Perl 5.42 on Windows out of CI until Sub::Private stops
+	crashing there.

@@ -19,7 +19,7 @@ use Scalar::Util qw(blessed);
 use Sub::Private { mode => 'enforce' };
 use Sub::Protected;
 
-our $VERSION = '0.001.0';
+use version; our $VERSION = version->declare('0.001.0');
 
 # Lock files are created world-readable/writable before the umask is applied,
 # so the directory's permissions decide who may take a lock

@@ -1,6 +1,6 @@
 # Generated from Makefile.PL using makefilepl2cpanfile
 
-requires 'perl', '5.16.0';
+requires 'perl', '5.26.0';
 
 requires 'autodie';
 requires 'Carp';
@@ -24,22 +24,34 @@ recommends 'CHI';
 recommends 'Compress::Zstd';
 recommends 'HTML::Packer';
 recommends 'IO::Compress::Brotli';
+recommends 'Redis';
+recommends 'Redis::Fast';
 
 on 'test' => sub {
+	requires 'Config';
 	requires 'Digest::MD5';
 	requires 'Encode';
 	requires 'Errno';
+	requires 'File::Basename';
+	requires 'File::Find';
 	requires 'File::Temp';
-	requires 'Mojo::Base';
+	requires 'IO::Handle';
+	requires 'IO::Socket::INET';
 	requires 'POSIX';
+	requires 'Storable';
 	requires 'Test::More';
-	requires 'Test::Without::Module';
 	recommends 'IP::Country::Fast';
+	recommends 'Redis';
+	recommends 'Redis::Fast';
+	recommends 'Test::Pod', '1.22';
+	recommends 'Test::Pod::Coverage', '1.08';
+	recommends 'Test::Without::Module';
 };
 
 on 'develop' => sub {
 	requires 'Devel::Cover';
 	requires 'Perl::Critic';
-	requires 'Test::Pod';
-	requires 'Test::Pod::Coverage';
+	requires 'Test::Pod', '1.22';
+	requires 'Test::Pod::Coverage', '1.08';
+	recommends 'App::Test::Generator';
 };

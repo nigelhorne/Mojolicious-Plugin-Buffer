@@ -1,0 +1,33 @@
+# Keep build output, editor files and repository metadata out of the
+# distribution when MANIFEST is regenerated with "make manifest"
+
+# Version control, CI and README generation
+^\.git/
+^\.pod2github\.ya?ml$
+^\.gitignore$
+^\.github/
+\.gitignore$
+
+# ExtUtils::MakeMaker output
+^blib/
+^_eumm/
+^Makefile$
+^Makefile\.old$
+^MYMETA\.
+^pm_to_blib$
+^MANIFEST\.(bak|SKIP)$
+^Mojolicious-Plugin-Buffer-
+
+# Coverage, profiling and generated schemas
+^cover_db/
+^nytprof
+^\.last_cover_stats$
+^schemas/
+
+# Local libraries and editor files
+^local/
+^\.carmel/
+~$
+\.swp$
+\.bak$
+\.tdy$

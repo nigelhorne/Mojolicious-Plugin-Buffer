@@ -1,14 +1,14 @@
-## Name
+## NAME
 
 Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious responses
 
-## Version
+## VERSION
 
 Version 0.001.0
 
-## Synopsis
+## SYNOPSIS
 
-### 1. The Smallest Set-Up
+### 1. The smallest set-up
 
 One line gives every page compression, an `ETag`, a `Last-Modified`
 header and `304 Not Modified` answers:
@@ -35,7 +35,7 @@ remove comments and shrink embedded CSS as well:
 plugin 'Buffer' => {optimise_content => 1};
 ```
 
-### 3. A Server-Side Cache for Slow Pages
+### 3. A server-side cache for slow pages
 
 Keep finished pages in a cache, so a slow action runs once and later
 visitors get the stored copy.  Call the helper _first_ in the action, but
@@ -58,7 +58,7 @@ get '/report' => sub {
 };
 ```
 
-### 4. Several Workers on One Machine
+### 4. Several workers on one machine
 
 With [hypnotoad](https://metacpan.org/pod/hypnotoad) there are several worker processes.  Share the cache
 between them, and give them a lock directory, so only one worker builds a
@@ -73,7 +73,7 @@ plugin 'Buffer' => {
 
 For workers on several machines, see ["Multiple hosts"](#multiple-hosts).
 
-### 5. One Response Is Different
+### 5. One response is different
 
 Put a `buffer` value in the stash.  `0` leaves the response alone; a hash
 changes some options for this response only:
@@ -92,7 +92,7 @@ get '/raw' => sub {
 };
 ```
 
-### 6. A Whole Section Is Different
+### 6. A whole section is different
 
 Some options can be set once for a group of routes:
 
@@ -101,7 +101,7 @@ my $docs = app->routes->under('/docs')->to(optimise_content => 1);
 $docs->get('/intro' => sub { shift->render(template => 'docs/intro') });
 ```
 
-### 7. Pages in Several Languages
+### 7. Pages in several languages
 
 Add `Accept-Language` to the cache key, so each language is stored
 separately:
@@ -113,7 +113,7 @@ plugin 'Buffer' => {
 };
 ```
 
-### 8. Translate the "Busy" Message
+### 8. Translate the "busy" message
 
 While one request builds a page, a request that waits too long gets
 `503 Service Unavailable` with a short text.  Change the text with
@@ -126,7 +126,7 @@ plugin 'Buffer' => {
 };
 ```
 
-### 9. A Full Application
+### 9. A full application
 
 ```perl
 package MyApp;
@@ -150,13 +150,13 @@ sub startup {
 1;
 ```
 
-## Description
+## DESCRIPTION
 
 `Mojolicious::Plugin::Buffer` makes the pages of a [Mojolicious](https://metacpan.org/pod/Mojolicious)
 application smaller and faster to deliver, without changes to your actions.
 It is the Mojolicious version of [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer).
 
-### What It Does
+### What it does
 
 After your action has made a page, and before the page is sent, the plugin
 can:
@@ -174,7 +174,7 @@ short `304 Not Modified` reply instead of the whole page;
 that a slow action does not have to run again for the next visitor (see
 ["buffer\_is\_cached"](#buffer_is_cached)).
 
-### How It Works, in Plain Words
+### How it works, in plain words
 
 - 1. When the application starts, ["register"](#register) checks your options and
 installs a _hook_: a small function that Mojolicious calls for every
@@ -206,7 +206,7 @@ The plugin works through a hook, so it also sees responses built with
 `$c->res->body` rather than `$c->render`.  Unlike the CGI modules
 it needs no source filter and no `END` block.
 
-### Words Used in This Document
+### Words used in this document
 
 - cache
 
@@ -249,7 +249,7 @@ it needs no source filter and no `END` block.
     Mojolicious's per-request hash of values, `$c->stash`.  The plugin
     reads its per-response options from `$c->stash('buffer')`.
 
-## Options
+## OPTIONS
 
 All options can be given to `plugin()` and, except where noted, overridden
 per request through the `buffer` stash value.  Options given to `plugin()`
@@ -258,7 +258,7 @@ are not, and an unusable one falls back to its default where that is safe.
 A few options describe a section of a site rather than one page and can be
 declared once for it; see ["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages).
 
-### Declaring Options for a Group of Pages
+### Declaring options for a group of pages
 
 ```perl
 # one route
@@ -309,7 +309,7 @@ can still be set for one response through the `buffer` stash.
 `examples/grouped-sections` is a runnable site with one section declared on
 an `under` route and one declared in a controller.
 
-### Compress\_Content
+### compress\_content
 
 Compress eligible responses, defaults to 1.  Set to 0 to only optimise (and
 remember that the plugin turns off ["compress" in Mojolicious::Renderer](https://metacpan.org/pod/Mojolicious%3A%3ARenderer#compress), so a
@@ -320,7 +320,7 @@ It can be declared for a group of pages (see
 ["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), which is the point of a section
 that serves files it has already compressed.
 
-### Optimise\_Content
+### optimise\_content
 
 How hard to optimise HTML, defaults to 0 (off).  Registration rejects any
 value other than 0, 1 or 2:
@@ -345,7 +345,7 @@ It can be declared for a group of pages (see
 ["Declaring options for a group of pages"](#declaring-options-for-a-group-of-pages)), for a static section that is
 always minified.
 
-### Rewrite\_Links
+### rewrite\_links
 
 When optimising, rewrite `<a href>` and `<img src>` links that
 point at the current site as absolute URLs into root-relative links, and
@@ -359,7 +359,7 @@ whose HTML is not used in place: a preview of a newsletter or a page rendered
 for another site needs its absolute URLs kept while still being optimised
 elsewhere.
 
-### Generate\_Etag
+### generate\_etag
 
 Add an `ETag` header to `200` responses to `GET` and `HEAD` requests,
 defaults to 1.  The tag is the MD5 of the response body before compression,
@@ -372,7 +372,7 @@ It is not declarable for a group of pages (see
 computing is a decision for one endpoint, not a policy for a section.  Skip
 the digest for one response with `$c->stash(buffer => {generate_etag => 0})`, or for the whole application with the plugin option.
 
-### Generate\_304
+### generate\_304
 
 Answer "you already have this page" with `304 Not Modified`, defaults to
 1\.  A browser that has a copy of a page asks the server whether its copy is
@@ -403,14 +403,17 @@ would contradict ["trust\_last\_modified"](#trust_last_modified).  Use
 `$c->stash(buffer => {generate_304 => 0})` where one endpoint must always
 send a body.
 
-### Last\_Modified
+### last\_modified
 
 Add a `Last-Modified` header, defaults to 1.  The header says when the page
 last changed.  The value may be:
 
 - 0 - do not add the header
 - 1 - the newest modification time of the application script (`$0`)
-and of every file and directory under the renderer's template paths
+and of every file and directory under the renderer's template paths.
+Symbolic links are followed, each directory is read once, and the scan
+stops 32 directories below a template path, which also ends a symbolic
+link that points back up the tree.
 - a number - a Unix epoch (seconds since 1970)
 - a date string - anything [Mojo::Date](https://metacpan.org/pod/Mojo%3A%3ADate) can read, such as
 `'Sun, 06 Nov 1994 08:49:37 GMT'`
@@ -439,7 +442,7 @@ option says; see ["Last-Modified performance"](#last-modified-performance).
 Under PSGI or another wrapper, `$0` may be the wrapper instead; pass an
 epoch or a code reference there.
 
-### Trust\_Last\_Modified
+### trust\_last\_modified
 
 Also answer `If-Modified-Since` when the page has an `ETag`, defaults to 0.
 
@@ -464,7 +467,7 @@ section that renders templates and nothing else.  It has no effect when
 ["generate\_304"](#generate_304) is off.  It cannot make a page safe; it only tells the
 plugin that the templates really are the only input.
 
-### Last-Modified Performance
+### Last-Modified performance
 
 The scan costs one `stat()` per file and directory under the renderer's
 paths.  On a tree of 10,000 templates in 100 directories, a request using the
@@ -486,7 +489,7 @@ entry built from an old template is thrown away.  Use
 every request: it costs one cache lookup per request, covers both uses, and
 bounds how long a template edit can be missed by its duration.
 
-### Template\_Mtime\_Cache
+### template\_mtime\_cache
 
 An optional cache object understanding `get()` and `set()`, such as a
 [CHI](https://metacpan.org/pod/CHI) instance, used to remember the result of the template mtime scan.
@@ -519,19 +522,19 @@ Keep ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) short 
 This option and ["template\_mtime\_cache\_duration"](#template_mtime_cache_duration) are read when the plugin is
 registered; they cannot be overridden through the `buffer` stash.
 
-### Template\_Mtime\_Cache\_Duration
+### template\_mtime\_cache\_duration
 
 How long a template mtime is kept, defaults to 10 seconds.  It is passed to
 the cache's `set()`, so for [CHI](https://metacpan.org/pod/CHI) it may be a number of seconds or a
 human-readable duration.
 
-### Min\_Compress\_Size
+### min\_compress\_size
 
 Do not compress bodies smaller than this many bytes, defaults to 32.  Must be
 a non-negative integer.  Compression is also skipped if it would not make the
 body smaller.
 
-### Encodings
+### encodings
 
 An arrayref of the content codings to offer, in server preference order.
 Defaults to `[qw(br zstd gzip)]`.  `br` is only offered if
@@ -540,7 +543,7 @@ is installed; gzip is always available.  `x-gzip` is accepted as a synonym
 for `gzip`.  Clients pick with the usual quality values, and `identity` is
 used when nothing acceptable is offered.
 
-### Compressible\_Types
+### compressible\_types
 
 An arrayref of media types to compress, defaults to `text/*`,
 `application/json`, `application/javascript`, `application/xml`,
@@ -548,25 +551,25 @@ An arrayref of media types to compress, defaults to `text/*`,
 Entries may be strings (matched exactly, case-insensitively) or regular
 expressions.
 
-### Excluded\_Types
+### excluded\_types
 
 An arrayref of media types that are never buffered, defaults to
 `text/event-stream`.  Entries may be strings or regular expressions.
 
-### Cache
+### cache
 
 An optional cache object understanding `get()`, `set()` and `remove()`,
 such as a [CHI](https://metacpan.org/pod/CHI) instance.  Defaults to undef, which disables the
 server-side cache.  See ["buffer\_is\_cached"](#buffer_is_cached) for the rules about what is
 cached and how keys are made.
 
-### Cache\_Duration
+### cache\_duration
 
 How long entries are kept in the cache, defaults to `'10 minutes'`.  It is
 passed to the cache's `set()`, so for [CHI](https://metacpan.org/pod/CHI) it may be a number of seconds
 or a human-readable duration.
 
-### Cache\_Key
+### cache\_key
 
 A string, or a coderef called with the controller, that overrides the
 generated cache key.  Useful when several URLs should share one entry, or
@@ -574,7 +577,7 @@ when the response depends on something the default key does not cover.  An
 empty string, or a coderef returning nothing, falls back to the generated
 key.
 
-### Cache\_Single\_Flight
+### cache\_single\_flight
 
 Only let one request at a time build a missing entry, defaults to 1.  When a
 request misses the cache while another request in the same worker is already
@@ -594,7 +597,7 @@ By default the in-flight table is per worker process, so with N [hypnotoad](http
 workers a cold entry can still be built up to N times.  Set ["cache\_lock"](#cache_lock) or
 ["cache\_lock\_dir"](#cache_lock_dir) to elect a single builder across processes instead.
 
-### Cache\_Lock
+### cache\_lock
 
 An optional object that elects one process to build a missing entry, for
 workers that cannot share a directory.  It must implement:
@@ -633,7 +636,7 @@ backends are [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/
 `cache_lock` cannot be combined with ["cache\_lock\_dir"](#cache_lock_dir), and is read when
 the plugin is registered rather than per response.
 
-### Cache\_Lock\_Timeout
+### cache\_lock\_timeout
 
 How long a request may wait for another request, in this worker or another
 one, to build the same entry.  Defaults to 10 seconds.  It also bounds how
@@ -641,7 +644,7 @@ long a key is considered to be in flight when the request building it never
 finishes.  Fractional seconds are allowed, so `0.5` is valid; zero and
 negative values are rejected.
 
-### Cache\_Lock\_Dir
+### cache\_lock\_dir
 
 A directory in which to keep lock files used to coalesce cache misses across
 worker processes, defaults to undef, which limits single-flight to one worker.
@@ -666,7 +669,7 @@ hosts, use ["cache\_lock"](#cache_lock) with
 [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis) instead.  It is read when the
 plugin is registered, not per response.
 
-### Vary\_by
+### vary\_by
 
 An arrayref of request header names that become part of the generated cache
 key.  Defaults to `['cookie']`, which keeps one client's session from being
@@ -676,7 +679,7 @@ response varies by language.  Header names are case-insensitive.  Headers
 listed here may also appear in the response's `Vary` header; a response
 that varies on anything else is not stored.
 
-### Messages
+### messages
 
 A hash reference of message overrides, keyed by message key, used for every
 error, log line and client-facing text the plugin produces, including the
@@ -695,13 +698,13 @@ plugin 'Buffer' => {
 It is passed to the lock backend built from ["cache\_lock\_dir"](#cache_lock_dir).  It is read
 when the plugin is registered, not per response.
 
-## Methods
+## METHODS
 
 `Mojolicious::Plugin::Buffer` inherits all methods from
 [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin) and implements the following new ones.  It also adds
 the ["buffer\_is\_cached"](#buffer_is_cached) helper to the application.
 
-### Register
+### register
 
 ```perl
 $plugin->register(Mojolicious->new, {optimise_content => 1});
@@ -727,7 +730,7 @@ you by `$app->plugin('Buffer', ...)`.
 
 The plugin object, so calls can be chained.
 
-#### Side Effects
+#### Side effects
 
 - Turns off ["compress" in Mojolicious::Renderer](https://metacpan.org/pod/Mojolicious%3A%3ARenderer#compress), because this plugin does
 the compression; see ["Interaction with the renderer"](#interaction-with-the-renderer).
@@ -758,7 +761,7 @@ get '/' => sub {
 app->start;
 ```
 
-#### Api Specification
+#### API SPECIFICATION
 
 ##### Input
 
@@ -799,10 +802,20 @@ app->start;
 { type => 'object', isa => 'Mojolicious::Plugin::Buffer' }
 ```
 
-#### Messages
+#### MESSAGES
 
 Every message croaks, from the caller's point of view.  The key is the
 [Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N) key that can be overridden.
+
+When several options are wrong, only one is reported: the first one when
+the option names are sorted in ASCII order (for example `cache` comes
+before `encodings`, and `generate_304` before `generate_etag`).  An
+unknown option name is reported in the same way, at its place in that
+order.  Fix it and register again to see the next problem.  The order is
+fixed, so the same mistake always gives the same message.  The checks
+that look at more than one option (`cache_lock` together with
+`cache_lock_dir`, and unknown `encodings` names) come after all of
+these.
 
 ```perl
 Key                             Message (after "Mojolicious::Plugin::Buffer: ")     Resolution
@@ -841,7 +854,7 @@ lock_dir_not_writable           cache_lock_dir 'DIR' is not a writable directory
 A failure to validate `$app` itself is reported by [Params::Validate::Strict](https://metacpan.org/pod/Params%3A%3AValidate%3A%3AStrict)
 and is not translated.
 
-#### Pseudocode
+#### PSEUDOCODE
 
 ```
 accept the options as a hash reference or a key/value list
@@ -861,7 +874,7 @@ add the buffer_is_cached helper
 return the plugin
 ```
 
-### Buffer\_Is\_Cached
+### buffer\_is\_cached
 
 ```perl
 get '/expensive' => sub {
@@ -924,7 +937,7 @@ hit, or a request now waiting for another one to build the entry.  False
 when the action must do its work: a miss, a bypassed request, no cache, or a
 cache that failed.
 
-#### Side Effects
+#### Side effects
 
 - On a hit: sets the status, headers and body and finishes the
 response.
@@ -952,7 +965,7 @@ get '/report' => sub {
 };
 ```
 
-#### Api Specification
+#### API SPECIFICATION
 
 ##### Input
 
@@ -967,7 +980,7 @@ get '/report' => sub {
 { type => 'boolean' }
 ```
 
-#### Messages
+#### MESSAGES
 
 The helper never croaks.  It logs:
 
@@ -985,7 +998,7 @@ log_gave_up             debug  The wait timed out; a 503 was sent
 log_finish_waiter_failed error Replaying to a waiting request failed
 ```
 
-#### Pseudocode
+#### PSEUDOCODE
 
 ```perl
 if the plugin is off for this response, return false
@@ -1026,7 +1039,7 @@ in full.
 
 The text of the message, or the key itself if it is unknown.
 
-#### Side Effects
+#### Side effects
 
 None.
 
@@ -1037,7 +1050,7 @@ my $plugin = $app->plugin('Buffer', messages => {log_cache_hit => 'HIT %{key}'})
 say $plugin->i18n('log_cache_hit', {key => 'buffer:abc'});   # HIT buffer:abc
 ```
 
-#### Api Specification
+#### API SPECIFICATION
 
 ##### Input
 
@@ -1055,11 +1068,11 @@ say $plugin->i18n('log_cache_hit', {key => 'buffer:abc'});   # HIT buffer:abc
 { type => 'string' }
 ```
 
-#### Messages
+#### MESSAGES
 
 See ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n).
 
-## Deployment
+## DEPLOYMENT
 
 ### Hypnotoad
 
@@ -1142,7 +1155,7 @@ permissions.  The cache directory must be writable by that user too.  Use
 `hypnotoad -f script/my_app` in the foreground while testing, and
 `hypnotoad -s script/my_app` to stop it.
 
-### Cache and Lock Requirements
+### Cache and lock requirements
 
 For workers on the same host, [CHI](https://metacpan.org/pod/CHI)'s `File` driver and the built-in file
 lock backend work.  Do not use `Memory`, and do not put a per-worker `L1`
@@ -1151,7 +1164,7 @@ built by another worker and would eventually receive `503 Service
 Unavailable`.  A shared filesystem with reliable `flock` can also be used
 on several hosts.
 
-### Multiple Hosts
+### Multiple hosts
 
 Workers on different hosts need a shared cache and a lock backend that does
 not rely on `flock`.  This example uses CHI's Memcached driver for the cache
@@ -1201,7 +1214,7 @@ that depends on the session needs ["cache\_key"](#cache_key) or a suitable ["var
 list.  Entries are discarded when the application script or a template
 changes, and otherwise expire after ["cache\_duration"](#cache_duration).
 
-## Notes
+## NOTES
 
 ### Testing
 
@@ -1240,7 +1253,7 @@ The private routines are guarded by [Sub::Private](https://metacpan.org/pod/Sub%
 white-box tests can reach them under `prove`; `t/16-encapsulation.t` turns
 that bypass off to check the guards themselves.
 
-### Why a Plugin?
+### Why a plugin?
 
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer) replaces `STDOUT` with an in-memory buffer and does its work
 in an `END` block, and [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer) buffers each FastCGI request and does
@@ -1250,7 +1263,7 @@ hook `after_dispatch` and rewrite it.  That gives the same effect without a
 source filter, without reading `$_`, and without depending on a specific
 server or environment.
 
-### Interaction With the Renderer
+### Interaction with the renderer
 
 `Mojolicious::Renderer` compresses rendered output with gzip by default
 (`compress` is on and `min_compress_size` is 860 bytes).  That happens
@@ -1262,16 +1275,16 @@ instead - with gzip, Brotli or Zstandard as negotiated, and with the header
 work the renderer does not do.  If you enable `$app->renderer->compress`
 after loading the plugin, those responses will be skipped by the plugin.
 
-### What Is Not Implemented
+### What is not implemented
 
 `save_to`, which rewrites dynamic pages into static ones, is a site
 generation feature rather than a response filter and is not part of this
 plugin.  The server-side cache is available as the opt-in
 ["buffer\_is\_cached"](#buffer_is_cached) helper described above.
 
-## Common Pitfalls
+## COMMON PITFALLS
 
-### The `Buffer` Stash: What Each Value Means
+### The `buffer` stash: what each value means
 
 - `buffer => 0` and `buffer => ''` turn the plugin
 **off** for this response.
@@ -1279,7 +1292,7 @@ plugin.  The server-side cache is available as the opt-in
 "nothing set here", so the plugin options are used.
 - `buffer => {}` keeps the plugin **on** and changes nothing.
 
-### The `Buffer` Stash Is Merged One Level Deep Only
+### The `buffer` stash is merged one level deep only
 
 The hash you put in the stash is laid over the plugin options one key at a
 time.  A key you give replaces the whole plugin value for that key; nothing
@@ -1296,7 +1309,7 @@ $c->stash(buffer => {encodings => ['br']});
 Values in the stash are not checked the way `plugin()` options are, and
 they are not filtered by which compression modules are installed.
 
-### Undef in Options
+### undef in options
 
 - In the `buffer` stash, an undef value is a real value.
 `{compress_content => undef}` turns compression **off** for that
@@ -1332,7 +1345,7 @@ the default" or "off":
 word `retry_later`.  Leave the key out instead.  See
 ["COMMON PITFALLS" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#COMMON-PITFALLS).
 
-### Using the Server-Side Cache Safely
+### Using the server-side cache safely
 
 - **Check access before ["buffer\_is\_cached"](#buffer_is_cached).**  A cached page is sent
 straight away and the rest of the action does not run.  Any login or
@@ -1354,7 +1367,7 @@ second worker starts building the same page.
 - **Template edits can be missed for a while** when
 ["template\_mtime\_cache"](#template_mtime_cache) is set: until its entry expires.
 
-### Other Pitfalls
+### Other pitfalls
 
 - **Do not turn the renderer's compression back on.**  The plugin turns
 off `$app->renderer->compress`.  If you turn it on again, the renderer
@@ -1367,7 +1380,7 @@ ends.**  The plugin reads it in `after_dispatch`.  To turn the cache off for
 one request, set `{cache => undef}` _before_ calling
 ["buffer\_is\_cached"](#buffer_is_cached).
 
-## Encoding
+## ENCODING
 
 This section says which text may contain non-ASCII characters, such as
 accented letters, other scripts and emoji.
@@ -1425,7 +1438,7 @@ accented letters, other scripts and emoji.
 
     These are ASCII words.
 
-## Limitations
+## LIMITATIONS
 
 - Only in-memory responses are processed.  Static files
 (`Mojo::Asset::File`) and streaming responses are left alone.
@@ -1488,18 +1501,18 @@ command.
 - The `503` text is chosen per application through ["messages"](#messages); it
 is not negotiated from `Accept-Language`.
 
-## See Also
+## SEE ALSO
 
 [CGI::Buffer](https://metacpan.org/pod/CGI%3A%3ABuffer), [FCGI::Buffer](https://metacpan.org/pod/FCGI%3A%3ABuffer), [CHI](https://metacpan.org/pod/CHI), [HTML::Packer](https://metacpan.org/pod/HTML%3A%3APacker),
 [Mojolicious::Plugin](https://metacpan.org/pod/Mojolicious%3A%3APlugin), [Mojolicious::Plugin::Buffer::Lock::File](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3AFile),
 [Mojolicious::Plugin::Buffer::Lock::Redis](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3ALock%3A%3ARedis),
 [Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N)
 
-## Author
+## AUTHOR
 
-Nigel Horne, `<njh at bandsman.co.uk>`
+Nigel Horne, `<njh at nigelhorne.com>`
 
-## Formal Specification
+## FORMAL SPECIFICATION
 
 This section describes the plugin in the Z notation, for readers who want
 an exact model.  You do not need it to use the plugin.  `now` is the
@@ -1537,7 +1550,7 @@ fresh : ℙ KEY
 fresh = { k : dom store | created k ≥ mtime }
 ```
 
-### Register
+### register
 
 ```
 ┌─ Register ──────────────────────────────────
@@ -1558,7 +1571,7 @@ fresh = { k : dom store | created k ≥ mtime }
 -- Any violated predicate: croak, and app? is unchanged
 ```
 
-### Buffer\_Is\_Cached
+### buffer\_is\_cached
 
 `cacheable(c)` holds when the plugin is on for this response, a cache is
 configured, the method is `GET` or `HEAD`, and the request carries no
@@ -1634,13 +1647,13 @@ Every 0.1 seconds, each request waiting for another worker looks again:
 The same operation as ["i18n" in Mojolicious::Plugin::Buffer::I18N](https://metacpan.org/pod/Mojolicious%3A%3APlugin%3A%3ABuffer%3A%3AI18N#i18n), where
 `overrides` is the ["messages"](#messages) option.
 
-## State Diagram
+## STATE DIAGRAM
 
 There are three pictures.  The numbers on the arrows are explained below
 each picture.  In each explanation, the text in `[ ]` is the condition and
 the text after `/` is what happens.
 
-### A. One Page in the Server-Side Cache
+### A. One page in the server-side cache
 
 This is the life of one cache key, seen by all workers together.
 
@@ -1706,7 +1719,7 @@ While BUILDING, a second request for the same key:
     too.
 ```
 
-### B. One Request That Calls Buffer\_Is\_Cached
+### B. One request that calls buffer\_is\_cached
 
 ```
                      buffer_is_cached
@@ -1762,7 +1775,7 @@ Calling buffer_is_cached again in the same request returns the same
 answer and changes nothing.
 ```
 
-### C. What the After\_Dispatch Hook Does With Every Response
+### C. What the after\_dispatch hook does with every response
 
 ```perl
  response finished by the action
@@ -1814,7 +1827,7 @@ answer and changes nothing.
     / 304 Not Modified is sent with no body
 ```
 
-## License and Copyright
+## LICENSE AND COPYRIGHT
 
 Copyright 2026 Nigel Horne.
 

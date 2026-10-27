@@ -5,7 +5,6 @@ examples/grouped-sections/lib/GroupedSections.pm
 examples/grouped-sections/README.md
 examples/grouped-sections/script/grouped_sections
 examples/grouped-sections/templates/docs/page.html.ep
-examples/hypnotoad/.gitignore
 examples/hypnotoad/lib/MyApp.pm
 examples/hypnotoad/README.md
 examples/hypnotoad/script/my_app
@@ -26,6 +25,7 @@ t/16-encapsulation.t
 t/20-optimise.t
 t/30-validators.t
 t/35-template-mtime.t
+t/36-template-mtime-no-inode.t
 t/40-options.t
 t/50-cache.t
 t/60-single-flight.t
@@ -37,3 +37,6 @@ t/85-example.t
 t/86-grouped-example.t
 t/90-without-recommended.t
 t/locales.t
+t/pod-coverage.t
+t/pod.t
+t/schemas.t

@@ -81,6 +81,11 @@ Readonly::Scalar my $MIN_WAITER_DELAY => 0.05;	# a waiter always gets one tick
 Readonly::Scalar my $SHARED_POLL_INTERVAL => 0.1;	# how often a cross-worker waiter looks
 Readonly::Scalar my $RETRY_AFTER => 1;
 
+# How deep the template mtime scan goes.  It is the loop guard of last
+# resort: where stat() reports no inode (Windows before Perl 5.38) a
+# symlink loop can only be told apart by its ever-longer path.
+Readonly::Scalar my $MAX_SCAN_DEPTH => 32;
+
 Readonly::Scalar my $DEFAULT_MIN_COMPRESS_SIZE => 32;
 Readonly::Scalar my $OPTIMISE_AGGRESSIVE => 2;	# optimise_content level that touches JavaScript
 
@@ -662,7 +667,10 @@ last changed.  The value may be:
 =item 0 - do not add the header
 
 =item 1 - the newest modification time of the application script (C<$0>)
-and of every file and directory under the renderer's template paths
+and of every file and directory under the renderer's template paths.
+Symbolic links are followed, each directory is read once, and the scan
+stops 32 directories below a template path, which also ends a symbolic
+link that points back up the tree.
 
 =item a number - a Unix epoch (seconds since 1970)
 
@@ -1065,6 +1073,16 @@ logs at debug level when L</optimise_content> is on without L<HTML::Packer>.
 
 Every message croaks, from the caller's point of view.  The key is the
 L<Mojolicious::Plugin::Buffer::I18N> key that can be overridden.
+
+When several options are wrong, only one is reported: the first one when
+the option names are sorted in ASCII order (for example C<cache> comes
+before C<encodings>, and C<generate_304> before C<generate_etag>).  An
+unknown option name is reported in the same way, at its place in that
+order.  Fix it and register again to see the next problem.  The order is
+fixed, so the same mistake always gives the same message.  The checks
+that look at more than one option (C<cache_lock> together with
+C<cache_lock_dir>, and unknown C<encodings> names) come after all of
+these.
 
     Key                             Message (after "Mojolicious::Plugin::Buffer: ")     Resolution
     ------------------------------  --------------------------------------------------  ---------------------------------
@@ -2460,26 +2478,36 @@ sub _template_mtime_cache_key :Private {
 #                 well as file mtimes: editing a file moves the file's
 #                 mtime, while adding, removing or renaming one moves its
 #                 directory's.  stat() follows symlinks, and the seen set
-#                 (device:inode) stops a symlink loop.
-# Entry criteria: $path is a path; $latest the best so far or undef.
+#                 stops a symlink loop.
+# Entry criteria: $path is a path; $latest the best so far or undef;
+#                 $depth how many directories down the walk is (undef at
+#                 the top).
 # Exit status:    The newer of $latest and anything under $path.
-# Side effects:   stat()s and reads directories; unreadable ones are
-#                 skipped.
+# Side effects:   stat()s and reads directories; unreadable ones, and
+#                 those deeper than $MAX_SCAN_DEPTH, are skipped.
 sub _latest_mtime :Private {
-	my ($path, $latest, $seen) = @_;
+	my ($path, $latest, $seen, $depth) = @_;
 
 	my @stat = stat($path);
 	return $latest unless @stat;
 
 	$latest = $stat[9] if defined($stat[9]) && (!defined($latest) || ($stat[9] > $latest));
 	return $latest unless -d _;
-	return $latest if $seen->{"$stat[0]:$stat[1]"}++;
+
+	# device:inode identifies a directory however it was reached.  Where
+	# the inode is always 0 (Windows before Perl 5.38) that key would make
+	# every directory after the first look already seen, so fall back to
+	# the path, and let the depth limit end a loop through a symlink.
+	my $id = $stat[1] ? "$stat[0]:$stat[1]" : File::Spec->canonpath($path);
+	return $latest if $seen->{$id}++;
+	$depth //= 0;
+	return $latest if $depth >= $MAX_SCAN_DEPTH;
 
 	# autodie makes an unreadable directory an exception; skipping it is the
 	# right answer for a freshness check, so catch it here
 	my $dh = eval { opendir(my $handle, $path); $handle } or return $latest;
 	for my $entry (File::Spec->no_upwards(readdir($dh))) {
-		$latest = _latest_mtime(File::Spec->catfile($path, $entry), $latest, $seen);
+		$latest = _latest_mtime(File::Spec->catfile($path, $entry), $latest, $seen, $depth + 1);
 	}
 	eval { closedir($dh) };
 
@@ -2602,7 +2630,11 @@ sub _squash :Private {
 
 	my $vault = _protect_verbatim(\$body);
 
-	$body =~ s/((\s+|\r)\n|\n\s+)/\n/g;
+	# Any run of white space that holds a line break becomes that one line
+	# break.  One pattern, so CRLF ("\r\n    <") loses its indentation as
+	# well as LF does: the old (\s+|\r)\n alternative consumed the "\n" and
+	# left the indentation after it behind.
+	$body =~ s/\s*\n\s*/\n/g;
 	$body =~ s/\<\/div\>\s+\<div/\<\/div\>\<div/gis;
 	$body =~ s/(<div>\s+|\s+<div>)/<div>/gis;
 	$body =~ s/\s+<\/div\>/\<\/div\>/gis;
@@ -3330,7 +3362,7 @@ L<Mojolicious::Plugin::Buffer::I18N>
 
 =head1 AUTHOR
 
-Nigel Horne, C<< <njh at bandsman.co.uk> >>
+Nigel Horne, C<< <njh at nigelhorne.com> >>
 
 =head1 FORMAL SPECIFICATION
 

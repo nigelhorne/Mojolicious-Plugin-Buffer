@@ -85,6 +85,16 @@ sub build_app {
 		$c->render(text => ('The quick brown fox jumps over the lazy dog. ' x 10)
 			. 'run ' . $app->{runs} . ' query=' . $c->req->url->query->to_string);
 	});
+	$app->routes->get('/missing' => sub {
+		my $c = shift;
+		return if $c->buffer_is_cached;
+		$c->render(text => $render->($c, 'missing'), status => 404);
+	});
+	$app->routes->get('/broken' => sub {
+		my $c = shift;
+		return if $c->buffer_is_cached;
+		$c->render(text => $render->($c, 'broken'), status => 500);
+	});
 	$app->routes->get('/header' => sub {
 		my $c = shift;
 		return if $c->buffer_is_cached;
@@ -240,6 +250,17 @@ subtest 'responses that must not be stored' => sub {
 	my $vary = $t->tx->res->body;
 	$t->get_ok('/vary')->status_is(200);
 	isnt($t->tx->res->body, $vary, 'Vary on a header that is not in the key is not stored');
+
+	# Only 200 responses are stored: an error page must not stick, or a
+	# page that was missing for a moment would stay missing until expiry
+	for my $error ([missing => 404], [broken => 500]) {
+		my ($path, $status) = @{$error};
+		$t->get_ok("/$path")->status_is($status);
+		my $first = $t->tx->res->body;
+		ok(!defined($t->tx->res->headers->etag), "a $status response has no ETag");
+		$t->get_ok("/$path")->status_is($status);
+		isnt($t->tx->res->body, $first, "a $status response is not stored");
+	}
 
 	is($cache->{sets}, 0, 'nothing was stored');
 };

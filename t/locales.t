@@ -282,19 +282,21 @@ for my $locale ('en_US.UTF-8', 'de_DE.UTF-8', 'ja_JP.UTF-8') {
 		ok(!$guard, 'no lock without a directory');
 		like($error, qr/^cannot open \Q$dir\E\S+: \Q$enoent\E$/, "the error carries Perl's ENOENT text ($enoent)");
 
-		# ENOTDIR, thrown: a plain file stands where a directory should be
+		# Thrown: a plain file stands where a directory should be.  POSIX
+		# systems say ENOTDIR; Windows says the path was not found (ENOENT)
 		my $file = File::Spec->catfile("$tmp", 'plain');
 		open(my $fh, '>', $file) or die "$file: $!";
 		close($fh);
 		my $under_file = File::Spec->catdir($file, 'locks');
-		my $enotdir = errno_text(ENOTDIR);
+		my ($errno_name, $errno) = ($^O eq 'MSWin32') ? ('ENOENT', ENOENT) : ('ENOTDIR', ENOTDIR);
+		my $errno_text = errno_text($errno);
 
 		eval { Mojolicious::Plugin::Buffer::Lock::File->new(dir => $under_file) };
-		like($@, qr/cannot create cache_lock_dir '\Q$under_file\E': .*\Q$enotdir\E/,
-			"new() croaks with Perl's ENOTDIR text ($enotdir)");
+		like($@, qr/cannot create cache_lock_dir '\Q$under_file\E': .*\Q$errno_text\E/,
+			"new() croaks with Perl's $errno_name text ($errno_text)");
 
 		eval { Mojolicious->new->plugin('Buffer', cache_lock_dir => $under_file) };
-		like($@, qr/cannot create cache_lock_dir '\Q$under_file\E': .*\Q$enotdir\E/,
+		like($@, qr/cannot create cache_lock_dir '\Q$under_file\E': .*\Q$errno_text\E/,
 			'registering the plugin croaks with the same text');
 
 		# The catalog text around the OS string is not localised by LC_ALL

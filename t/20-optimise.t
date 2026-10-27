@@ -346,6 +346,39 @@ subtest 'optimising keeps multi-byte UTF-8 characters whole' => sub {
 	like($decoded // '', qr/\x{420}\x{a0}<\/div>/, 'a no-break space is kept: it is content, not markup');
 };
 
+# Windows checks templates out with CRLF line endings.  The squasher once
+# matched "\r\n" on its own, so the indentation after it survived.
+subtest 'indentation after CRLF line breaks is squashed' => sub {
+	my $page = join("\r\n",
+		'<!doctype html>',
+		'<html>',
+		'  <head>',
+		'    <title>CRLF</title>',
+		'  </head>',
+		'  <body>',
+		'    <div class="card">',
+		'      <h1>Heading</h1>',
+		'    </div>',
+		'  </body>',
+		'</html>',
+		'',
+	);
+
+	my $crlf = Mojolicious->new;
+	$crlf->log->level('fatal');
+	$crlf->plugin('Buffer', optimise_content => 1);
+	$crlf->routes->get('/' => sub { shift->render(data => $page, format => 'html') });
+
+	my $ct = Test::Mojo->new($crlf);
+	$ct->ua->transactor->compressed(0);
+	$ct->get_ok('/')->status_is(200);
+
+	my $body = $ct->tx->res->body;
+	unlike($body, qr/\n[ \t]+</, 'no line starts with indentation');
+	unlike($body, qr/\r/, 'no carriage return is left in the white space');
+	like($body, qr{<h1>Heading</h1>}, 'the content is kept');
+};
+
 subtest 'optimise_content rejects unknown levels' => sub {
 	eval { Mojolicious->new->plugin('Buffer', optimise_content => 3) };
 	like($@, qr/optimise_content must be 0, 1 or 2/, 'level 3 is rejected');

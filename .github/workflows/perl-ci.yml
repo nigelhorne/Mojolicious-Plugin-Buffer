@@ -149,6 +149,51 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # The matrix below only uses current Perls and the newest CPAN releases.
+  # This job installs the oldest versions Makefile.PL accepts, so a declared
+  # minimum cannot drift away from what the code really needs.
+  minimum-versions:
+    name: Minimum Perl and dependency versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AUTOMATED_TESTING: 1
+      NO_NETWORK_TESTING: 1
+      NONINTERACTIVE_TESTING: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1.44.3
+        with:
+          perl-version: "5.26"
+
+      - name: Install the minimum versions
+        run: |
+          cpanm --notest --local-lib=~/perl5 local::lib
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          # Keep these in step with MIN_PERL_VERSION and PREREQ_PM.
+          # Readonly is not pinned: 2.00 is no longer downloadable, so the
+          # current release is used.
+          cpanm --notest \
+            SRI/Mojolicious-9.0.tar.gz \
+            Params::Get@0.17 \
+            Params::Validate::Strict@0.41 \
+            Return::Set@0.05 \
+            Sub::Private@0.07 \
+            Sub::Protected@0.03
+          cpanm --notest --installdeps .
+
+      - name: Check the pinned versions were not upgraded
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          perl -MMojolicious -e 'exit($Mojolicious::VERSION == 9.0 ? 0 : 1)'
+
+      - name: Run tests
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          prove -lr t/
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -167,6 +212,13 @@ jobs:
         exclude:
           - os: windows-latest
             perl: "5.40"
+          # Every test process dies with an access violation (exit status
+          # 5, the low byte of 0xC0000005) as soon as Sub::Private is
+          # loaded.  Sub-Private's own suite fails the same way on this
+          # runner, so it is not this distribution's code.  Remove this
+          # once a Sub::Private release passes on Windows 5.42.
+          - os: windows-latest
+            perl: "5.42"
     name: Perl ${{ matrix.perl }} on ${{ matrix.os }}
     env:
       AUTOMATED_TESTING: 1
@@ -285,6 +337,19 @@ jobs:
           set "PATH=%USERPROFILE%\perl5\bin;%PATH%"
           set "PERL5LIB=%USERPROFILE%\perl5\lib\perl5"
           prove -lr t/
+
+      - name: Author tests
+        if: matrix.perl == '5.42' && matrix.os == 'ubuntu-latest'
+        run: |
+          eval $(perl -I ~/perl5/lib/perl5 -Mlocal::lib)
+          cpanm --notest Test::Pod Test::Pod::Coverage
+          # t/schemas.t skips when extract-schemas is missing, so a failed
+          # install of this larger tool does not fail the job.  The main
+          # test step only runs these when the tools happen to be
+          # installed; this step installs them.
+          cpanm --notest App::Test::Generator || true
+          prove -l t/pod.t t/pod-coverage.t t/schemas.t
+        shell: bash
 
       - name: Run Perl::Critic
         if: matrix.perl == '5.42' && matrix.os == 'ubuntu-latest'

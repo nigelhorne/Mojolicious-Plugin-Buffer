@@ -17,7 +17,7 @@ use Sub::Private { mode => 'enforce' };
 use Sub::Protected;
 use Time::HiRes ();
 
-our $VERSION = '0.001.0';
+use version; our $VERSION = version->declare('0.001.0');
 
 Readonly::Scalar my $DEFAULT_NAMESPACE => 'buffer:lock:';
 Readonly::Scalar my $DEFAULT_TTL => 60;
