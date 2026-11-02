@@ -30,7 +30,7 @@ use Sub::Private { mode => 'enforce' };
 use Sub::Protected;
 use Time::HiRes ();
 
-use version; our $VERSION = version->declare('0.001.0');
+use version; our $VERSION = version->declare('0.001.1');
 
 # ---------------------------------------------------------------------------
 # Constants.  Nothing below this block should contain a bare number or a
@@ -218,7 +218,7 @@ Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious respon
 
 =head1 VERSION
 
-Version 0.001.0
+Version 0.001.1
 
 =cut
 

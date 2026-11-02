@@ -4,7 +4,7 @@ Mojolicious::Plugin::Buffer - Optimise, compress and validate Mojolicious respon
 
 ## VERSION
 
-Version 0.001.0
+Version 0.001.1
 
 ## SYNOPSIS
 
