@@ -1,6 +1,6 @@
 Revision history for Mojolicious-Plugin-Buffer
 
-0.002.0	Wed Nov  4 02:02:04 PM EST 2026
+0.002.0	Wed Nov  4 04:17:22 PM EST 2026
 	[ Enhancements ]
 	- New option min_compress_saving: a response is not compressed
 		unless compression saves at least this many bytes, defaults
