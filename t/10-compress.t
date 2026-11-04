@@ -115,6 +115,58 @@ subtest 'small bodies are left alone' => sub {
 	is($t->tx->res->body, $SHORT, 'short body is unchanged');
 };
 
+subtest 'compression must save min_compress_saving bytes' => sub {
+	# Find the shortest bodies (at least min_compress_size long) that gzip
+	# saves exactly 15 and exactly 16 bytes on, so the test does not depend
+	# on the zlib version
+	my %body;
+	for my $length (32 .. 200) {
+		my $text = 'a' x $length;
+		my $saving = $length - length(Mojo::Util::gzip($text));
+		$body{$saving} //= $text;
+	}
+	ok(defined($body{15}) && defined($body{16}), 'found bodies saving 15 and 16 bytes') or return;
+
+	my $saving_app = sub {
+		my (%options) = @_;
+		my $app = Mojolicious->new;
+		$app->log->level('error');
+		$app->plugin('Buffer', encodings => ['gzip'], %options);
+		$app->routes->get('/:saving' => sub {
+			my $c = shift;
+			my $override = $c->param('min');
+			$c->stash(buffer => {min_compress_saving => $override}) if defined($override);
+			$c->render(data => $body{$c->param('saving')}, format => 'txt');
+		});
+		my $t = Test::Mojo->new($app);
+		$t->ua->transactor->compressed(0);
+		return $t;
+	};
+
+	my $default = $saving_app->();
+	$default->get_ok('/15' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($default->tx->res->headers->content_encoding), 'a 15 byte saving is not used by default');
+	is($default->tx->res->body, $body{15}, 'and the body is unchanged');
+	like($default->tx->res->headers->vary // '', qr/Accept-Encoding/i, 'Vary still describes the negotiation');
+
+	$default->get_ok('/16' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($default->tx->res->headers->content_encoding, 'gzip', 'a 16 byte saving is used by default');
+	is(gunzip($default->tx->res->body), $body{16}, 'and the body gunzips to the original');
+
+	my $zero = $saving_app->(min_compress_saving => 0);
+	$zero->get_ok('/15' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($zero->tx->res->headers->content_encoding, 'gzip', 'min_compress_saving => 0 compresses any saving');
+
+	my $high = $saving_app->(min_compress_saving => 17);
+	$high->get_ok('/16' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($high->tx->res->headers->content_encoding), 'min_compress_saving => 17 refuses a 16 byte saving');
+
+	$default->get_ok('/15?min=0' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($default->tx->res->headers->content_encoding, 'gzip', 'the buffer stash can lower it for one response');
+	$default->get_ok('/16?min=1000' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($default->tx->res->headers->content_encoding), 'and raise it');
+};
+
 subtest 'compressible types' => sub {
 	$t->get_ok('/plain' => {'Accept-Encoding' => 'gzip'})->status_is(200);
 	is($t->tx->res->headers->content_encoding, 'gzip', 'text/plain is compressed');
