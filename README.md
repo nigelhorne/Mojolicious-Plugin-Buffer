@@ -534,7 +534,7 @@ human-readable duration.
 
 ### min\_compress\_size
 
-Do not compress bodies smaller than this many bytes, defaults to 32.  Must be
+Do not compress bodies smaller than this many bytes, defaults to 64.  Must be
 a non-negative integer.  See also ["min\_compress\_saving"](#min_compress_saving).
 
 ### min\_compress\_saving
@@ -838,7 +838,7 @@ option_flag                     NAME must be a true or false value              
 option_optimise_content         optimise_content must be 0, 1 or 2                  Use one of the documented levels
 option_last_modified            last_modified must be 0, 1, an epoch, a date        Pass a scalar or a coderef
                                 string or a code reference
-option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 32
+option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 64
 option_min_compress_saving      min_compress_saving must be a non-negative integer  Pass e.g. 16
 option_encodings                encodings must be an array reference                Pass [qw(br gzip)]
 unknown_encoding                unknown encoding 'NAME'                             Use br, zstd, gzip or x-gzip

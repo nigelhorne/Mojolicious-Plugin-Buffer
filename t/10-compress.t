@@ -115,14 +115,51 @@ subtest 'small bodies are left alone' => sub {
 	is($t->tx->res->body, $SHORT, 'short body is unchanged');
 };
 
+subtest 'bodies shorter than min_compress_size are not compressed' => sub {
+	# Highly compressible, so only the size decides
+	my %body = (short => 'a' x 63, long => 'a' x 64);
+
+	my $size_app = sub {
+		my $app = Mojolicious->new;
+		$app->log->level('error');
+		$app->plugin('Buffer', encodings => ['gzip'], @_);
+		$app->routes->get('/:which' => sub {
+			my $c = shift;
+			$c->render(data => $body{$c->param('which')}, format => 'txt');
+		});
+		my $t = Test::Mojo->new($app);
+		$t->ua->transactor->compressed(0);
+		return $t;
+	};
+
+	my $default = $size_app->();
+	$default->get_ok('/short' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($default->tx->res->headers->content_encoding), 'a 63 byte body is not compressed by default');
+	is($default->tx->res->body, $body{short}, 'and the body is unchanged');
+	$default->get_ok('/long' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($default->tx->res->headers->content_encoding, 'gzip', 'a 64 byte body is compressed by default');
+	is(gunzip($default->tx->res->body), $body{long}, 'and the body gunzips to the original');
+
+	my $lower = $size_app->(min_compress_size => 63);
+	$lower->get_ok('/short' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	is($lower->tx->res->headers->content_encoding, 'gzip', 'min_compress_size => 63 compresses a 63 byte body');
+
+	my $higher = $size_app->(min_compress_size => 65);
+	$higher->get_ok('/long' => {'Accept-Encoding' => 'gzip'})->status_is(200);
+	ok(!defined($higher->tx->res->headers->content_encoding), 'min_compress_size => 65 leaves a 64 byte body alone');
+};
+
 subtest 'compression must save min_compress_saving bytes' => sub {
-	# Find the shortest bodies (at least min_compress_size long) that gzip
-	# saves exactly 15 and exactly 16 bytes on, so the test does not depend
-	# on the zlib version
+	# Find bodies (at least min_compress_size long) that gzip saves exactly
+	# 15 and exactly 16 bytes on, so the test does not depend on the zlib
+	# version.  64 bytes that do not compress, followed by a run of a's,
+	# saves about one more byte for each a.
+	my $seed = 1;
+	my $noise = join('', map { $seed = ($seed * 1103515245 + 12345) % 2**31; chr(($seed >> 16) % 256) } 1 .. 64);
 	my %body;
-	for my $length (32 .. 200) {
-		my $text = 'a' x $length;
-		my $saving = $length - length(Mojo::Util::gzip($text));
+	for my $run (0 .. 200) {
+		my $text = $noise . ('a' x $run);
+		my $saving = length($text) - length(Mojo::Util::gzip($text));
 		$body{$saving} //= $text;
 	}
 	ok(defined($body{15}) && defined($body{16}), 'found bodies saving 15 and 16 bytes') or return;

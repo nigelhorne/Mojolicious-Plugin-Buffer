@@ -86,7 +86,7 @@ Readonly::Scalar my $RETRY_AFTER => 1;
 # symlink loop can only be told apart by its ever-longer path.
 Readonly::Scalar my $MAX_SCAN_DEPTH => 32;
 
-Readonly::Scalar my $DEFAULT_MIN_COMPRESS_SIZE => 32;
+Readonly::Scalar my $DEFAULT_MIN_COMPRESS_SIZE => 64;
 Readonly::Scalar my $DEFAULT_MIN_COMPRESS_SAVING => 16;	# bytes compression must save to be used
 Readonly::Scalar my $OPTIMISE_AGGRESSIVE => 2;	# optimise_content level that touches JavaScript
 
@@ -801,7 +801,7 @@ human-readable duration.
 
 =head2 min_compress_size
 
-Do not compress bodies smaller than this many bytes, defaults to 32.  Must be
+Do not compress bodies smaller than this many bytes, defaults to 64.  Must be
 a non-negative integer.  See also L</min_compress_saving>.
 
 =head2 min_compress_saving
@@ -1105,7 +1105,7 @@ these.
     option_optimise_content         optimise_content must be 0, 1 or 2                  Use one of the documented levels
     option_last_modified            last_modified must be 0, 1, an epoch, a date        Pass a scalar or a coderef
                                     string or a code reference
-    option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 32
+    option_min_compress_size        min_compress_size must be a non-negative integer    Pass e.g. 64
     option_min_compress_saving      min_compress_saving must be a non-negative integer  Pass e.g. 16
     option_encodings                encodings must be an array reference                Pass [qw(br gzip)]
     unknown_encoding                unknown encoding 'NAME'                             Use br, zstd, gzip or x-gzip
